@@ -35,6 +35,27 @@ pub struct VcsInfo {
     pub vcs_type: VcsType,
 }
 
+/// Whitespace comparison policy used when a backend materializes diff hunks.
+///
+/// This is a local-diff setting,
+/// not a review-session identity or forge option.
+/// Cheap change probes intentionally ignore it so selectors can still show
+/// staged/unstaged choices before the full diff is loaded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiffWhitespaceMode {
+    /// Compare whitespace normally.
+    #[default]
+    Normal,
+    /// Ignore all whitespace while comparing lines.
+    IgnoreAll,
+}
+
+impl DiffWhitespaceMode {
+    pub fn ignores_all(self) -> bool {
+        matches!(self, Self::IgnoreAll)
+    }
+}
+
 /// Commit information for commit selection UI
 #[derive(Debug, Clone)]
 pub struct CommitInfo {

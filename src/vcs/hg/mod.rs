@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +9,7 @@ use crate::error::{Result, TuicrError};
 use crate::model::{DiffFile, DiffLine, FileStatus, LineOrigin};
 use crate::syntax::SyntaxHighlighter;
 use crate::vcs::diff_parser::{self, DiffFormat};
-use crate::vcs::traits::{CommitInfo, VcsBackend, VcsInfo, VcsType};
+use crate::vcs::traits::{CommitInfo, DiffWhitespaceMode, VcsBackend, VcsInfo, VcsType};
 use crate::vcs::{BATCH_BOUNDARY, apply_container_full_file_highlight, parse_batched_files};
 
 /// Parse an hg description into (summary, optional body).
@@ -30,11 +31,12 @@ fn parse_hg_description(desc: &str) -> (String, Option<String>) {
 /// Mercurial backend implementation using hg CLI commands
 pub struct HgBackend {
     info: VcsInfo,
+    whitespace_mode: DiffWhitespaceMode,
 }
 
 impl HgBackend {
     /// Discover a Mercurial repository from the current directory
-    pub fn discover() -> Result<Self> {
+    pub fn discover(whitespace_mode: DiffWhitespaceMode) -> Result<Self> {
         // Use `hg root` to find the repository root
         // This handles being called from subdirectories
         let root_output = Command::new("hg")
@@ -48,20 +50,20 @@ impl HgBackend {
 
         let root_path = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
 
-        Self::from_path(root_path)
+        Self::from_path(root_path, whitespace_mode)
     }
 
     /// Create backend from a known path (used by discover and tests)
-    fn from_path(root_path: PathBuf) -> Result<Self> {
+    fn from_path(root_path: PathBuf, whitespace_mode: DiffWhitespaceMode) -> Result<Self> {
         // Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
         let root_path = root_path.canonicalize().unwrap_or(root_path);
 
         // Get current revision info
-        let head_commit = run_hg_command(&root_path, &["id", "-i"])
+        let head_commit = run_hg_command(&root_path, ["id", "-i"])
             .map(|s| s.trim().trim_end_matches('+').to_string())
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let branch_name = run_hg_command(&root_path, &["branch"])
+        let branch_name = run_hg_command(&root_path, ["branch"])
             .ok()
             .map(|s| s.trim().to_string());
 
@@ -72,7 +74,22 @@ impl HgBackend {
             vcs_type: VcsType::Mercurial,
         };
 
-        Ok(Self { info })
+        Ok(Self {
+            info,
+            whitespace_mode,
+        })
+    }
+
+    fn diff_args<'a>(&self, args: &'a [&'a str]) -> Cow<'a, [&'a str]> {
+        if !self.whitespace_mode.ignores_all() {
+            return Cow::Borrowed(args);
+        }
+
+        let mut args_with_whitespace = Vec::with_capacity(args.len() + 1);
+        args_with_whitespace.push(args[0]);
+        args_with_whitespace.push("--ignore-all-space");
+        args_with_whitespace.extend_from_slice(&args[1..]);
+        Cow::Owned(args_with_whitespace)
     }
 }
 
@@ -82,7 +99,8 @@ impl VcsBackend for HgBackend {
     }
 
     fn get_working_tree_diff(&self, highlighter: &SyntaxHighlighter) -> Result<Vec<DiffFile>> {
-        let diff_output = run_hg_command(&self.info.root_path, &["diff"])?;
+        let args = self.diff_args(&["diff"]);
+        let diff_output = run_hg_command(&self.info.root_path, args.iter().copied())?;
 
         if diff_output.trim().is_empty() {
             return Err(TuicrError::NoChanges);
@@ -114,9 +132,9 @@ impl VcsBackend for HgBackend {
 
         let path_str = file_path.to_string_lossy();
         let content = if let Some(commit) = ref_commit {
-            run_hg_command(&self.info.root_path, &["cat", "-r", commit, &path_str])?
+            run_hg_command(&self.info.root_path, ["cat", "-r", commit, &path_str])?
         } else if file_status == FileStatus::Deleted {
-            run_hg_command(&self.info.root_path, &["cat", "-r", ".", &path_str])?
+            run_hg_command(&self.info.root_path, ["cat", "-r", ".", &path_str])?
         } else {
             std::fs::read_to_string(self.info.root_path.join(file_path))?
         };
@@ -148,9 +166,9 @@ impl VcsBackend for HgBackend {
     ) -> Result<u32> {
         let path_str = file_path.to_string_lossy();
         let content = if let Some(commit) = ref_commit {
-            run_hg_command(&self.info.root_path, &["cat", "-r", commit, &path_str])?
+            run_hg_command(&self.info.root_path, ["cat", "-r", commit, &path_str])?
         } else if file_status == FileStatus::Deleted {
-            run_hg_command(&self.info.root_path, &["cat", "-r", ".", &path_str])?
+            run_hg_command(&self.info.root_path, ["cat", "-r", ".", &path_str])?
         } else {
             std::fs::read_to_string(self.info.root_path.join(file_path))?
         };
@@ -162,7 +180,7 @@ impl VcsBackend for HgBackend {
         // hg log outputs newest first; we reverse so oldest is first.
         let output = run_hg_command(
             &self.info.root_path,
-            &["log", "-r", revisions, "--template", "{node}\\n"],
+            ["log", "-r", revisions, "--template", "{node}\\n"],
         )?;
 
         let mut commit_ids: Vec<String> = output
@@ -192,7 +210,7 @@ impl VcsBackend for HgBackend {
             "{node}\\x00{node|short}\\x00{desc}\\x00{author|user}\\x00{date|hgdate}\\x01";
         let output = run_hg_command(
             &self.info.root_path,
-            &[
+            [
                 "log",
                 "-l",
                 &fetch_count.to_string(),
@@ -273,7 +291,7 @@ impl VcsBackend for HgBackend {
         // We use "log -r 'parents({oldest})'" to get the parent hash
         let parent_output = run_hg_command(
             &self.info.root_path,
-            &[
+            [
                 "log",
                 "-r",
                 &format!("parents({})", oldest_short),
@@ -288,10 +306,9 @@ impl VcsBackend for HgBackend {
             _ => "null".to_string(),
         };
 
-        let diff_output = run_hg_command(
-            &self.info.root_path,
-            &["diff", "-r", &from_rev, "-r", newest_short],
-        )?;
+        let diff_args = ["diff", "-r", &from_rev, "-r", newest_short];
+        let args = self.diff_args(&diff_args);
+        let diff_output = run_hg_command(&self.info.root_path, args.iter().copied())?;
 
         if diff_output.trim().is_empty() {
             return Err(TuicrError::NoChanges);
@@ -329,7 +346,7 @@ impl VcsBackend for HgBackend {
             "{node}\\x00{node|short}\\x00{desc}\\x00{author|user}\\x00{date|hgdate}\\x01";
         let output = run_hg_command(
             &self.info.root_path,
-            &["log", "-r", &revset, "--template", template],
+            ["log", "-r", &revset, "--template", template],
         )?;
 
         let mut by_id: HashMap<String, CommitInfo> = HashMap::new();
@@ -390,7 +407,7 @@ impl VcsBackend for HgBackend {
         // Get the parent of the oldest commit
         let parent_output = run_hg_command(
             &self.info.root_path,
-            &[
+            [
                 "log",
                 "-r",
                 &format!("parents({})", oldest_short),
@@ -404,7 +421,9 @@ impl VcsBackend for HgBackend {
             _ => "null".to_string(),
         };
 
-        let diff_output = run_hg_command(&self.info.root_path, &["diff", "-r", &from_rev])?;
+        let diff_args = ["diff", "-r", &from_rev];
+        let args = self.diff_args(&diff_args);
+        let diff_output = run_hg_command(&self.info.root_path, args.iter().copied())?;
 
         if diff_output.trim().is_empty() {
             return Err(TuicrError::NoChanges);
@@ -443,20 +462,29 @@ fn hg_cat_batch(root: &Path, rev: &str, paths: &[PathBuf]) -> Result<HashMap<Pat
     Ok(parse_batched_files(&output))
 }
 
-/// Run an hg command and return its stdout
-fn run_hg_command(root: &Path, args: &[&str]) -> Result<String> {
+/// Run an hg command and return its stdout.
+fn run_hg_command<I, S>(root: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args: Vec<S> = args.into_iter().collect();
     let output = Command::new("hg")
         .current_dir(root)
-        .args(args)
+        .args(args.iter().map(|arg| arg.as_ref()))
         .output()
         .map_err(|e| TuicrError::VcsCommand(format!("Failed to run hg: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let rendered_args = args
+            .iter()
+            .map(|arg| arg.as_ref().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(TuicrError::VcsCommand(format!(
             "hg {} failed: {}",
-            args.join(" "),
-            stderr
+            rendered_args, stderr
         )));
     }
 
@@ -491,7 +519,7 @@ mod tests {
 
         let root_path = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
 
-        HgBackend::from_path(root_path)
+        HgBackend::from_path(root_path, DiffWhitespaceMode::Normal)
     }
 
     /// Create a temporary hg repo for testing.
@@ -560,8 +588,8 @@ mod tests {
         };
 
         // Use from_path directly to avoid set_current_dir race conditions
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         // Canonicalize temp path to handle macOS /var -> /private/var symlink
         let expected_path = temp.path().canonicalize().unwrap();
@@ -581,6 +609,82 @@ mod tests {
     }
 
     #[test]
+    fn test_hg_diff_ignores_all_whitespace_when_configured() {
+        let Some(temp) = setup_test_repo() else {
+            eprintln!("Skipping test: hg command not available");
+            return;
+        };
+
+        fs::write(temp.path().join("hello.txt"), " hello world \n")
+            .expect("Failed to write whitespace-only edit");
+        let backend =
+            HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::IgnoreAll)
+                .expect("Failed to create hg backend");
+
+        assert!(matches!(
+            backend.get_working_tree_diff(&SyntaxHighlighter::default()),
+            Err(TuicrError::NoChanges)
+        ));
+
+        fs::write(temp.path().join("hello.txt"), " hello ship \n")
+            .expect("Failed to write non-whitespace edit");
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("non-whitespace edit should still produce a diff");
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn test_hg_working_tree_with_commits_ignores_all_whitespace_when_configured() {
+        let Some(temp) = setup_test_repo() else {
+            eprintln!("Skipping test: hg command not available");
+            return;
+        };
+
+        fs::write(temp.path().join("hello.txt"), " hello world \n")
+            .expect("Failed to write whitespace-only edit");
+        let output = Command::new("hg")
+            .args(["commit", "-m", "Whitespace commit"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to commit whitespace edit");
+        assert!(
+            output.status.success(),
+            "hg commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let backend =
+            HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::IgnoreAll)
+                .expect("Failed to create hg backend");
+        let commits = backend
+            .get_recent_commits(0, 5)
+            .expect("Failed to get commits");
+        let whitespace_commit = commits
+            .iter()
+            .find(|commit| commit.summary == "Whitespace commit")
+            .expect("Expected whitespace commit");
+
+        assert!(matches!(
+            backend.get_working_tree_with_commits_diff(
+                &[whitespace_commit.id.clone()],
+                &SyntaxHighlighter::default()
+            ),
+            Err(TuicrError::NoChanges)
+        ));
+
+        fs::write(temp.path().join("hello.txt"), " hello ship \n")
+            .expect("Failed to write non-whitespace edit");
+        let files = backend
+            .get_working_tree_with_commits_diff(
+                &[whitespace_commit.id.clone()],
+                &SyntaxHighlighter::default(),
+            )
+            .expect("non-whitespace edit should still produce a diff");
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
     fn test_hg_fetch_context_lines() {
         let Some(temp) = setup_test_repo() else {
             eprintln!("Skipping test: hg command not available");
@@ -588,8 +692,8 @@ mod tests {
         };
 
         // Use from_path directly to avoid set_current_dir race conditions
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         // Canonicalize temp path to handle macOS /var -> /private/var symlink
         let expected_path = temp.path().canonicalize().unwrap();
@@ -666,8 +770,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         let commits = backend
             .get_recent_commits(0, 5)
@@ -694,8 +798,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         let commits = backend
             .get_recent_commits(0, 5)
@@ -785,8 +889,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
@@ -858,8 +962,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
@@ -918,8 +1022,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
@@ -975,8 +1079,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
             .expect("Failed to get diff");
@@ -1026,8 +1130,8 @@ mod tests {
             .output()
             .expect("Failed to remove file");
 
-        let backend =
-            HgBackend::from_path(temp.path().to_path_buf()).expect("Failed to create hg backend");
+        let backend = HgBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create hg backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())

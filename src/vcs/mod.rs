@@ -25,7 +25,9 @@ pub use git::{GitBackend, GitBackendPreference};
 pub use hg::HgBackend;
 pub use jj::JjBackend;
 pub use pr_noop::PrNoopVcs;
-pub use traits::{ChangeKind, CommitInfo, VcsBackend, VcsChangeStatus, VcsInfo};
+pub use traits::{
+    ChangeKind, CommitInfo, DiffWhitespaceMode, VcsBackend, VcsChangeStatus, VcsInfo,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -298,19 +300,22 @@ fn apply_full_file_spans(
 ///
 /// Detection order: Jujutsu → Git → Mercurial.
 /// Jujutsu is tried first because jj repos are Git-backed.
-pub fn detect_vcs(git_backend_preference: GitBackendPreference) -> Result<Box<dyn VcsBackend>> {
+pub fn detect_vcs(
+    git_backend_preference: GitBackendPreference,
+    whitespace_mode: DiffWhitespaceMode,
+) -> Result<Box<dyn VcsBackend>> {
     // Try jj first since jj repos are Git-backed
-    if let Ok(backend) = JjBackend::discover() {
+    if let Ok(backend) = JjBackend::discover(whitespace_mode) {
         return Ok(Box::new(backend));
     }
 
     // Try git
-    if let Ok(backend) = GitBackend::discover(git_backend_preference) {
+    if let Ok(backend) = GitBackend::discover(git_backend_preference, whitespace_mode) {
         return Ok(Box::new(backend));
     }
 
     // Try hg
-    if let Ok(backend) = HgBackend::discover() {
+    if let Ok(backend) = HgBackend::discover(whitespace_mode) {
         return Ok(Box::new(backend));
     }
 
@@ -326,7 +331,8 @@ mod tests {
     #[test]
     fn exports_are_accessible() {
         // Verify that public types are properly exported
-        let _: fn(GitBackendPreference) -> Result<Box<dyn VcsBackend>> = detect_vcs;
+        let _: fn(GitBackendPreference, DiffWhitespaceMode) -> Result<Box<dyn VcsBackend>> =
+            detect_vcs;
 
         // VcsInfo can be constructed
         let info = VcsInfo {
@@ -356,7 +362,7 @@ mod tests {
         // Note: This test may pass or fail depending on where tests are run
         // In CI or outside a repo, it should fail with NotARepository
         // Inside the tuicr repo (which is git), it will succeed
-        let result = detect_vcs(GitBackendPreference::Libgit2);
+        let result = detect_vcs(GitBackendPreference::Libgit2, DiffWhitespaceMode::Normal);
 
         // We just verify the function runs without panic
         // The actual result depends on the environment

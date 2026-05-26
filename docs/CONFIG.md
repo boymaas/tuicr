@@ -25,6 +25,7 @@ theme_dark = "gruvbox-dark"
 theme_light = "gruvbox-light"
 
 diff_view = "side-by-side"
+ignore_whitespace = false
 show_file_list = true
 mouse = true
 leader = ","
@@ -58,6 +59,7 @@ comment_type_prefix = true
 | `theme_dark` | (none) | Theme name for dark appearance (paired with `theme_light`). |
 | `theme_light` | (none) | Theme name for light appearance (paired with `theme_dark`). |
 | `diff_view` | `unified` | `unified` or `side-by-side`. Toggle in-app with `:diff`. |
+| `ignore_whitespace` | `false` | Ignore all whitespace in local Git, jj, and hg diffs. PR diffs are unchanged. |
 | `show_file_list` | `true` | Whether the file list panel is visible on startup. Toggle with `<leader>e`. |
 | `mouse` | `true` | Wheel scrolling, clicks, and drag-to-select. |
 | `leader` | `;` | Single-character prefix for panel focus, sidebar toggles, and review-comment shortcuts. Invalid multi-character values are ignored with a startup warning. |

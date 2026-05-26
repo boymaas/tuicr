@@ -28,7 +28,7 @@ use tuicr::handler::{
 };
 use tuicr::input::{Action, map_key_to_action, map_target_filter_mode};
 use tuicr::theme::resolve_theme_with_config;
-use tuicr::vcs::GitBackendPreference;
+use tuicr::vcs::{DiffWhitespaceMode, GitBackendPreference};
 use tuicr::{config, handler, profile, ui, update};
 
 /// Timeout for the "press Ctrl+C again to exit" feature
@@ -146,6 +146,16 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|cfg| cfg.backend.as_deref()),
     );
+    let diff_whitespace_mode = if config_outcome
+        .config
+        .as_ref()
+        .and_then(|cfg| cfg.ignore_whitespace)
+        .unwrap_or(false)
+    {
+        DiffWhitespaceMode::IgnoreAll
+    } else {
+        DiffWhitespaceMode::Normal
+    };
 
     let mut app = match profile::time("startup.app_init", || {
         App::new(
@@ -162,6 +172,7 @@ fn main() -> anyhow::Result<()> {
                 file_path: cli_args.file_path.as_deref(),
                 all_files: cli_args.all_files,
                 git_backend_preference,
+                diff_whitespace_mode,
                 pr_target: cli_args.pr_target.as_deref(),
                 repo_url_override: cli_args
                     .repo_url

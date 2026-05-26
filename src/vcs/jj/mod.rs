@@ -1,5 +1,6 @@
 //! Jujutsu (jj) backend implementation using CLI commands.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,7 +11,7 @@ use crate::error::{Result, TuicrError};
 use crate::model::{DiffFile, DiffLine, FileStatus, LineOrigin};
 use crate::syntax::SyntaxHighlighter;
 use crate::vcs::diff_parser::{self, DiffFormat};
-use crate::vcs::traits::{CommitInfo, VcsBackend, VcsInfo, VcsType};
+use crate::vcs::traits::{CommitInfo, DiffWhitespaceMode, VcsBackend, VcsInfo, VcsType};
 use crate::vcs::{BATCH_BOUNDARY, apply_container_full_file_highlight, parse_batched_files};
 
 /// Parse a jj description into (summary, optional body).
@@ -32,11 +33,12 @@ fn parse_description(desc: &str) -> (String, Option<String>) {
 /// Jujutsu backend implementation using jj CLI commands
 pub struct JjBackend {
     info: VcsInfo,
+    whitespace_mode: DiffWhitespaceMode,
 }
 
 impl JjBackend {
     /// Discover a Jujutsu repository from the current directory
-    pub fn discover() -> Result<Self> {
+    pub fn discover(whitespace_mode: DiffWhitespaceMode) -> Result<Self> {
         // Use `jj root` to find the repository root
         // This handles being called from subdirectories
         let root_output = Command::new("jj")
@@ -50,18 +52,18 @@ impl JjBackend {
 
         let root_path = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
 
-        Self::from_path(root_path)
+        Self::from_path(root_path, whitespace_mode)
     }
 
     /// Create backend from a known path (used by discover and tests)
-    fn from_path(root_path: PathBuf) -> Result<Self> {
+    fn from_path(root_path: PathBuf, whitespace_mode: DiffWhitespaceMode) -> Result<Self> {
         // Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
         let root_path = root_path.canonicalize().unwrap_or(root_path);
 
         // Get current change id (jj uses change IDs rather than commit hashes)
         let head_commit = run_jj_command(
             &root_path,
-            &["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
+            ["log", "-r", "@", "--no-graph", "-T", "change_id.short()"],
         )
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -70,7 +72,7 @@ impl JjBackend {
         // First check if @ has a bookmark directly, otherwise find the closest ancestor bookmark
         let branch_name = run_jj_command(
             &root_path,
-            &["log", "-r", "@", "--no-graph", "-T", "bookmarks"],
+            ["log", "-r", "@", "--no-graph", "-T", "bookmarks"],
         )
         .ok()
         .map(|s| s.trim().to_string())
@@ -79,7 +81,7 @@ impl JjBackend {
             // Find the closest bookmark in ancestors using heads(::@ & bookmarks())
             run_jj_command(
                 &root_path,
-                &[
+                [
                     "log",
                     "-r",
                     "heads(::@ & bookmarks())",
@@ -109,7 +111,22 @@ impl JjBackend {
             vcs_type: VcsType::Jujutsu,
         };
 
-        Ok(Self { info })
+        Ok(Self {
+            info,
+            whitespace_mode,
+        })
+    }
+
+    fn diff_args<'a>(&self, args: &'a [&'a str]) -> Cow<'a, [&'a str]> {
+        if !self.whitespace_mode.ignores_all() {
+            return Cow::Borrowed(args);
+        }
+
+        let mut args_with_whitespace = Vec::with_capacity(args.len() + 1);
+        args_with_whitespace.push(args[0]);
+        args_with_whitespace.push("--ignore-all-space");
+        args_with_whitespace.extend_from_slice(&args[1..]);
+        Cow::Owned(args_with_whitespace)
     }
 }
 
@@ -119,7 +136,8 @@ impl VcsBackend for JjBackend {
     }
 
     fn get_working_tree_diff(&self, highlighter: &SyntaxHighlighter) -> Result<Vec<DiffFile>> {
-        let diff_output = run_jj_command(&self.info.root_path, &["diff", "--git"])?;
+        let args = self.diff_args(&["diff", "--git"]);
+        let diff_output = run_jj_command(&self.info.root_path, args.iter().copied())?;
 
         if diff_output.trim().is_empty() {
             return Err(TuicrError::NoChanges);
@@ -154,12 +172,12 @@ impl VcsBackend for JjBackend {
         let content = if let Some(commit) = ref_commit {
             run_jj_command(
                 &self.info.root_path,
-                &["file", "show", "-r", commit, &path_str],
+                ["file", "show", "-r", commit, &path_str],
             )?
         } else if file_status == FileStatus::Deleted {
             run_jj_command(
                 &self.info.root_path,
-                &["file", "show", "-r", "@-", &path_str],
+                ["file", "show", "-r", "@-", &path_str],
             )?
         } else {
             std::fs::read_to_string(self.info.root_path.join(file_path))?
@@ -194,12 +212,12 @@ impl VcsBackend for JjBackend {
         let content = if let Some(commit) = ref_commit {
             run_jj_command(
                 &self.info.root_path,
-                &["file", "show", "-r", commit, &path_str],
+                ["file", "show", "-r", commit, &path_str],
             )?
         } else if file_status == FileStatus::Deleted {
             run_jj_command(
                 &self.info.root_path,
-                &["file", "show", "-r", "@-", &path_str],
+                ["file", "show", "-r", "@-", &path_str],
             )?
         } else {
             std::fs::read_to_string(self.info.root_path.join(file_path))?
@@ -212,7 +230,7 @@ impl VcsBackend for JjBackend {
         // We reverse the result so the oldest commit is first (matching get_commit_range_diff expectations).
         let output = run_jj_command(
             &self.info.root_path,
-            &[
+            [
                 "log",
                 "-r",
                 revisions,
@@ -249,7 +267,7 @@ impl VcsBackend for JjBackend {
         let template = r#"commit_id ++ "\x00" ++ commit_id.short() ++ "\x00" ++ description ++ "\x00" ++ author.email() ++ "\x00" ++ committer.timestamp() ++ "\x01""#;
         let output = run_jj_command(
             &self.info.root_path,
-            &[
+            [
                 "log",
                 "-r",
                 "::@",
@@ -313,10 +331,9 @@ impl VcsBackend for JjBackend {
         // Get the parent of the oldest commit to include its changes
         // In jj, we use {commit}- to get the parent(s)
         let from_rev = format!("{}-", oldest);
-        let diff_output = run_jj_command(
-            &self.info.root_path,
-            &["diff", "--from", &from_rev, "--to", newest, "--git"],
-        )?;
+        let diff_args = ["diff", "--from", &from_rev, "--to", newest, "--git"];
+        let args = self.diff_args(&diff_args);
+        let diff_output = run_jj_command(&self.info.root_path, args.iter().copied())?;
 
         if diff_output.trim().is_empty() {
             return Err(TuicrError::NoChanges);
@@ -348,7 +365,7 @@ impl VcsBackend for JjBackend {
         let template = r#"commit_id ++ "\x00" ++ commit_id.short() ++ "\x00" ++ description ++ "\x00" ++ author.email() ++ "\x00" ++ committer.timestamp() ++ "\x01""#;
         let output = run_jj_command(
             &self.info.root_path,
-            &["log", "-r", &revset, "--no-graph", "-T", template],
+            ["log", "-r", &revset, "--no-graph", "-T", template],
         )?;
 
         let mut by_id: HashMap<String, CommitInfo> = HashMap::new();
@@ -400,10 +417,9 @@ impl VcsBackend for JjBackend {
 
         // Diff from the parent of the oldest commit to the working copy (@)
         let from_rev = format!("{}-", oldest);
-        let diff_output = run_jj_command(
-            &self.info.root_path,
-            &["diff", "--from", &from_rev, "--to", "@", "--git"],
-        )?;
+        let diff_args = ["diff", "--from", &from_rev, "--to", "@", "--git"];
+        let args = self.diff_args(&diff_args);
+        let diff_output = run_jj_command(&self.info.root_path, args.iter().copied())?;
 
         if diff_output.trim().is_empty() {
             return Err(TuicrError::NoChanges);
@@ -441,20 +457,29 @@ fn jj_show_batch(root: &Path, rev: &str, paths: &[PathBuf]) -> Result<HashMap<Pa
     Ok(parse_batched_files(&output))
 }
 
-/// Run a jj command and return its stdout
-fn run_jj_command(root: &Path, args: &[&str]) -> Result<String> {
+/// Run a jj command and return its stdout.
+fn run_jj_command<I, S>(root: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args: Vec<S> = args.into_iter().collect();
     let output = Command::new("jj")
         .current_dir(root)
-        .args(args)
+        .args(args.iter().map(|arg| arg.as_ref()))
         .output()
         .map_err(|e| TuicrError::VcsCommand(format!("Failed to run jj: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let rendered_args = args
+            .iter()
+            .map(|arg| arg.as_ref().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(TuicrError::VcsCommand(format!(
             "jj {} failed: {}",
-            args.join(" "),
-            stderr
+            rendered_args, stderr
         )));
     }
 
@@ -489,7 +514,7 @@ mod tests {
 
         let root_path = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
 
-        JjBackend::from_path(root_path)
+        JjBackend::from_path(root_path, DiffWhitespaceMode::Normal)
     }
 
     /// Create a temporary jj repo for testing.
@@ -560,8 +585,8 @@ mod tests {
         };
 
         // Use from_path directly to avoid set_current_dir race conditions
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         // Canonicalize temp path to handle macOS /var -> /private/var symlink
         let expected_path = temp.path().canonicalize().unwrap();
@@ -581,6 +606,84 @@ mod tests {
     }
 
     #[test]
+    fn test_jj_diff_surfaces_noop_file_when_whitespace_only_diff_is_empty() {
+        let Some(temp) = setup_test_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+
+        fs::write(temp.path().join("hello.txt"), " hello world \n")
+            .expect("Failed to write whitespace-only edit");
+        let backend =
+            JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::IgnoreAll)
+                .expect("Failed to create jj backend");
+
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("whitespace-only edit may surface as a no-op diff file");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].hunks.is_empty());
+
+        fs::write(temp.path().join("hello.txt"), " hello ship \n")
+            .expect("Failed to write non-whitespace edit");
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("non-whitespace edit should still produce a diff");
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn test_jj_working_tree_with_commits_surfaces_noop_file_for_whitespace_only_diff() {
+        let Some(temp) = setup_test_repo() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+
+        fs::write(temp.path().join("hello.txt"), " hello world \n")
+            .expect("Failed to write whitespace-only edit");
+        let output = Command::new("jj")
+            .args(["commit", "-m", "Whitespace commit"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to commit whitespace edit");
+        assert!(
+            output.status.success(),
+            "jj commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let backend =
+            JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::IgnoreAll)
+                .expect("Failed to create jj backend");
+        let commits = backend
+            .get_recent_commits(0, 10)
+            .expect("Failed to get commits");
+        let whitespace_commit = commits
+            .iter()
+            .find(|commit| commit.summary == "Whitespace commit")
+            .expect("Expected whitespace commit");
+
+        let files = backend
+            .get_working_tree_with_commits_diff(
+                &[whitespace_commit.id.clone()],
+                &SyntaxHighlighter::default(),
+            )
+            .expect("whitespace-only edit may surface as a no-op diff file");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].hunks.is_empty());
+
+        fs::write(temp.path().join("hello.txt"), " hello ship \n")
+            .expect("Failed to write non-whitespace edit");
+        let files = backend
+            .get_working_tree_with_commits_diff(
+                &[whitespace_commit.id.clone()],
+                &SyntaxHighlighter::default(),
+            )
+            .expect("non-whitespace edit should still produce a diff");
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
     fn test_jj_fetch_context_lines() {
         let Some(temp) = setup_test_repo() else {
             eprintln!("Skipping test: jj command not available");
@@ -588,8 +691,8 @@ mod tests {
         };
 
         // Use from_path directly to avoid set_current_dir race conditions
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         // Canonicalize temp path to handle macOS /var -> /private/var symlink
         let expected_path = temp.path().canonicalize().unwrap();
@@ -664,8 +767,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         let commits = backend
             .get_recent_commits(0, 5)
@@ -706,8 +809,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         let commits = backend
             .get_recent_commits(0, 10)
@@ -781,8 +884,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
@@ -832,8 +935,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
@@ -867,8 +970,8 @@ mod tests {
         // Delete the binary file
         fs::remove_file(root.join("image.png")).expect("Failed to delete file");
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
 
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
@@ -961,8 +1064,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
         let files = backend
             .get_working_tree_diff(&SyntaxHighlighter::default())
             .expect("Failed to get diff");
@@ -996,8 +1099,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
         let info = backend.info();
 
         assert_eq!(
@@ -1060,8 +1163,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
         let info = backend.info();
 
         assert_eq!(
@@ -1109,8 +1212,8 @@ mod tests {
             return;
         };
 
-        let backend =
-            JjBackend::from_path(temp.path().to_path_buf()).expect("Failed to create jj backend");
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
         let info = backend.info();
 
         assert!(

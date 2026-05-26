@@ -12,7 +12,9 @@ use crate::error::{Result, TuicrError};
 use crate::model::{DiffFile, DiffHunk, DiffLine, FileStatus, LineOrigin, LineSide};
 use crate::syntax::SyntaxHighlighter;
 use crate::vcs::diff_parser::{self, DiffFormat};
-use crate::vcs::{ChangeKind, CommitInfo, VcsBackend, VcsChangeStatus, VcsInfo};
+use crate::vcs::{
+    ChangeKind, CommitInfo, DiffWhitespaceMode, VcsBackend, VcsChangeStatus, VcsInfo,
+};
 use crate::vcs::{container_file_paths, enhance_with_full_file_highlight, tabify};
 
 use super::{
@@ -33,6 +35,7 @@ pub struct GitCliBackend {
     repo_mode: GitRepoMode,
     untracked_cache: bool,
     fsmonitor: bool,
+    whitespace_mode: DiffWhitespaceMode,
 }
 
 #[derive(Clone, Copy)]
@@ -44,7 +47,7 @@ enum GitContentSource<'a> {
 }
 
 impl GitCliBackend {
-    pub(super) fn discover_from(cwd: &Path) -> Result<Self> {
+    pub(super) fn discover_from(cwd: &Path, whitespace_mode: DiffWhitespaceMode) -> Result<Self> {
         let root_path =
             PathBuf::from(run_git_command(cwd, &["rev-parse", "--show-toplevel"])?.trim());
         let repo_mode = GitRepoMode::detect(&root_path)?;
@@ -71,6 +74,7 @@ impl GitCliBackend {
             repo_mode,
             untracked_cache,
             fsmonitor,
+            whitespace_mode,
         })
     }
 
@@ -80,12 +84,15 @@ impl GitCliBackend {
 
     fn get_cli_diff(
         &self,
-        args: Vec<String>,
+        mut args: Vec<String>,
         include_untracked: bool,
         old_source: GitContentSource<'_>,
         new_source: GitContentSource<'_>,
         highlighter: &SyntaxHighlighter,
     ) -> Result<Vec<DiffFile>> {
+        if self.whitespace_mode.ignores_all() {
+            args.insert(1, "--ignore-all-space".to_string());
+        }
         let mut files = match run_git_diff_command(&self.root_path, args, highlighter) {
             Ok(files) => files,
             Err(TuicrError::NoChanges) => Vec::new(),
@@ -105,7 +112,6 @@ impl GitCliBackend {
             git_source_content_cache(&self.root_path, old_source, &files, LineSide::Old);
         let new_cache =
             git_source_content_cache(&self.root_path, new_source, &files, LineSide::New);
-
         enhance_with_full_file_highlight(
             &mut files,
             highlighter,
@@ -1167,7 +1173,8 @@ mod tests {
         git(workdir, &["sparse-checkout", "reapply", "--sparse-index"]);
         git(workdir, &["config", "advice.sparseIndexExpanded", "false"]);
 
-        let backend = GitCliBackend::discover_from(workdir).expect("failed to discover backend");
+        let backend = GitCliBackend::discover_from(workdir, DiffWhitespaceMode::Normal)
+            .expect("failed to discover backend");
         (temp_dir, backend, vec![first_id, second_id])
     }
 
@@ -1208,8 +1215,8 @@ mod tests {
         git(workdir, &["add", "staged.txt"]);
         write_file(workdir, "untracked.txt", "untracked\n");
 
-        let cli_backend =
-            GitCliBackend::discover_from(workdir).expect("failed to discover cli backend");
+        let cli_backend = GitCliBackend::discover_from(workdir, DiffWhitespaceMode::Normal)
+            .expect("failed to discover cli backend");
         let repo = git2::Repository::open(workdir).expect("failed to open git2 repo");
         (temp_dir, cli_backend, repo, vec![first_id, second_id])
     }
@@ -1386,15 +1393,22 @@ mod tests {
 
         assert_eq!(
             summarize_files(cli_backend.get_working_tree_diff(&highlighter).unwrap()),
-            summarize_files(diff::get_working_tree_diff(&repo, &highlighter).unwrap())
+            summarize_files(
+                diff::get_working_tree_diff(&repo, DiffWhitespaceMode::Normal, &highlighter)
+                    .unwrap()
+            )
         );
         assert_eq!(
             summarize_files(cli_backend.get_staged_diff(&highlighter).unwrap()),
-            summarize_files(diff::get_staged_diff(&repo, &highlighter).unwrap())
+            summarize_files(
+                diff::get_staged_diff(&repo, DiffWhitespaceMode::Normal, &highlighter).unwrap()
+            )
         );
         assert_eq!(
             summarize_files(cli_backend.get_unstaged_diff(&highlighter).unwrap()),
-            summarize_files(diff::get_unstaged_diff(&repo, &highlighter).unwrap())
+            summarize_files(
+                diff::get_unstaged_diff(&repo, DiffWhitespaceMode::Normal, &highlighter).unwrap()
+            )
         );
         assert_eq!(
             summarize_files(
@@ -1403,7 +1417,13 @@ mod tests {
                     .unwrap()
             ),
             summarize_files(
-                diff::get_commit_range_diff(&repo, &[ids[1].clone()], &highlighter).unwrap()
+                diff::get_commit_range_diff(
+                    &repo,
+                    &[ids[1].clone()],
+                    DiffWhitespaceMode::Normal,
+                    &highlighter,
+                )
+                .unwrap()
             )
         );
         assert_eq!(
@@ -1413,8 +1433,13 @@ mod tests {
                     .unwrap()
             ),
             summarize_files(
-                diff::get_working_tree_with_commits_diff(&repo, &[ids[1].clone()], &highlighter)
-                    .unwrap()
+                diff::get_working_tree_with_commits_diff(
+                    &repo,
+                    &[ids[1].clone()],
+                    DiffWhitespaceMode::Normal,
+                    &highlighter,
+                )
+                .unwrap()
             )
         );
 
@@ -1449,5 +1474,34 @@ mod tests {
                 .map(|commit| (&commit.id, &commit.summary, &commit.body))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn cli_diff_ignores_all_whitespace_when_configured() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let workdir = temp_dir.path();
+
+        git(workdir, &["init"]);
+        git(workdir, &["config", "user.email", "test@example.com"]);
+        git(workdir, &["config", "user.name", "Test User"]);
+        git(workdir, &["config", "commit.gpgsign", "false"]);
+        write_file(workdir, "file.txt", "alpha\nbeta\n");
+        git(workdir, &["add", "."]);
+        git(workdir, &["commit", "-m", "initial"]);
+
+        let backend = GitCliBackend::discover_from(workdir, DiffWhitespaceMode::IgnoreAll)
+            .expect("failed to discover cli backend");
+
+        write_file(workdir, "file.txt", " alpha \n beta\n");
+        assert!(matches!(
+            backend.get_working_tree_diff(&SyntaxHighlighter::default()),
+            Err(TuicrError::NoChanges)
+        ));
+
+        write_file(workdir, "file.txt", " alpha \ngamma\n");
+        let files = backend
+            .get_working_tree_diff(&SyntaxHighlighter::default())
+            .expect("non-whitespace edit should still produce a diff");
+        assert_eq!(files.len(), 1);
     }
 }

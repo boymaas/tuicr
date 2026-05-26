@@ -13,7 +13,9 @@ use crate::model::{DiffFile, DiffLine, FileStatus};
 use crate::process::{CommandOutputError, CommandOutputErrorKind, run_command_output};
 use crate::syntax::SyntaxHighlighter;
 
-use super::traits::{ChangeKind, CommitInfo, VcsBackend, VcsChangeStatus, VcsInfo};
+use super::traits::{
+    ChangeKind, CommitInfo, DiffWhitespaceMode, VcsBackend, VcsChangeStatus, VcsInfo,
+};
 use cli::GitCliBackend;
 pub use libgit2::Libgit2Backend;
 
@@ -101,24 +103,40 @@ impl GitRepoMode {
 
 impl GitBackend {
     /// Discover a git repository from the current directory.
-    pub fn discover(preference: GitBackendPreference) -> Result<Self> {
+    pub fn discover(
+        preference: GitBackendPreference,
+        whitespace_mode: DiffWhitespaceMode,
+    ) -> Result<Self> {
         let cwd = std::env::current_dir().map_err(|_| TuicrError::NotARepository)?;
-        Self::discover_from(&cwd, preference)
+        Self::discover_from(&cwd, preference, whitespace_mode)
     }
 
-    fn discover_from(cwd: &Path, preference: GitBackendPreference) -> Result<Self> {
+    fn discover_from(
+        cwd: &Path,
+        preference: GitBackendPreference,
+        whitespace_mode: DiffWhitespaceMode,
+    ) -> Result<Self> {
         if preference == GitBackendPreference::Cli {
-            return Ok(Self::Cli(GitCliBackend::discover_from(cwd)?));
+            return Ok(Self::Cli(GitCliBackend::discover_from(
+                cwd,
+                whitespace_mode,
+            )?));
         }
 
         if uses_reftable(cwd) {
-            return Ok(Self::Cli(GitCliBackend::discover_from(cwd)?));
+            return Ok(Self::Cli(GitCliBackend::discover_from(
+                cwd,
+                whitespace_mode,
+            )?));
         }
 
-        let backend = Self::Libgit2(Libgit2Backend::discover_from(cwd)?);
+        let backend = Self::Libgit2(Libgit2Backend::discover_from(cwd, whitespace_mode)?);
         let repo_mode = GitRepoMode::detect(&backend.info().root_path)?;
         if repo_mode.is_sparse_checkout() && !backend.supports_sparse_checkout() {
-            return Ok(Self::Cli(GitCliBackend::discover_from(cwd)?));
+            return Ok(Self::Cli(GitCliBackend::discover_from(
+                cwd,
+                whitespace_mode,
+            )?));
         }
 
         Ok(backend)
@@ -358,8 +376,12 @@ mod tests {
         run_git_command(root, &["sparse-checkout", "set", "src"])
             .expect("failed to set sparse checkout paths");
 
-        let backend = GitBackend::discover_from(root, GitBackendPreference::Libgit2)
-            .expect("failed to discover backend");
+        let backend = GitBackend::discover_from(
+            root,
+            GitBackendPreference::Libgit2,
+            DiffWhitespaceMode::Normal,
+        )
+        .expect("failed to discover backend");
 
         match backend {
             GitBackend::Cli(backend) => {
@@ -379,8 +401,12 @@ mod tests {
         let root = temp_dir.path();
         setup_standard_repo(root);
 
-        let backend = GitBackend::discover_from(root, GitBackendPreference::Libgit2)
-            .expect("failed to discover backend");
+        let backend = GitBackend::discover_from(
+            root,
+            GitBackendPreference::Libgit2,
+            DiffWhitespaceMode::Normal,
+        )
+        .expect("failed to discover backend");
 
         match backend {
             GitBackend::Libgit2(backend) => assert!(!backend.supports_sparse_checkout()),
@@ -398,8 +424,12 @@ mod tests {
         run_git_command(root, &["config", "extensions.refStorage", "reftable"])
             .expect("failed to set reftable extension");
 
-        let backend = GitBackend::discover_from(root, GitBackendPreference::Libgit2)
-            .expect("reftable repo should open via CLI fallback");
+        let backend = GitBackend::discover_from(
+            root,
+            GitBackendPreference::Libgit2,
+            DiffWhitespaceMode::Normal,
+        )
+        .expect("reftable repo should open via CLI fallback");
 
         assert!(
             matches!(backend, GitBackend::Cli(_)),

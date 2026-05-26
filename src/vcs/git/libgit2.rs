@@ -7,12 +7,15 @@ use crate::model::{DiffFile, DiffLine, FileStatus};
 use crate::syntax::SyntaxHighlighter;
 
 use super::{context, diff, repository, staging};
-use crate::vcs::traits::{ChangeKind, CommitInfo, VcsBackend, VcsInfo, VcsType};
+use crate::vcs::traits::{
+    ChangeKind, CommitInfo, DiffWhitespaceMode, VcsBackend, VcsInfo, VcsType,
+};
 
 /// Git backend implementation using the git2/libgit2 library.
 pub struct Libgit2Backend {
     repo: Repository,
     info: VcsInfo,
+    whitespace_mode: DiffWhitespaceMode,
 }
 
 /// Declare libgit2 extensions tuicr understands so discovery doesn't refuse
@@ -35,7 +38,7 @@ fn register_supported_extensions() {
 }
 
 impl Libgit2Backend {
-    pub(super) fn discover_from(cwd: &Path) -> Result<Self> {
+    pub(super) fn discover_from(cwd: &Path, whitespace_mode: DiffWhitespaceMode) -> Result<Self> {
         register_supported_extensions();
         let repo = Repository::discover(cwd).map_err(|_| TuicrError::NotARepository)?;
 
@@ -79,7 +82,11 @@ impl Libgit2Backend {
             vcs_type: VcsType::Git,
         };
 
-        Ok(Self { repo, info })
+        Ok(Self {
+            repo,
+            info,
+            whitespace_mode,
+        })
     }
 }
 
@@ -93,15 +100,15 @@ impl VcsBackend for Libgit2Backend {
     }
 
     fn get_working_tree_diff(&self, highlighter: &SyntaxHighlighter) -> Result<Vec<DiffFile>> {
-        diff::get_working_tree_diff(&self.repo, highlighter)
+        diff::get_working_tree_diff(&self.repo, self.whitespace_mode, highlighter)
     }
 
     fn get_staged_diff(&self, highlighter: &SyntaxHighlighter) -> Result<Vec<DiffFile>> {
-        diff::get_staged_diff(&self.repo, highlighter)
+        diff::get_staged_diff(&self.repo, self.whitespace_mode, highlighter)
     }
 
     fn get_unstaged_diff(&self, highlighter: &SyntaxHighlighter) -> Result<Vec<DiffFile>> {
-        diff::get_unstaged_diff(&self.repo, highlighter)
+        diff::get_unstaged_diff(&self.repo, self.whitespace_mode, highlighter)
     }
 
     fn list_changed_paths(&self, kind: ChangeKind) -> Result<Vec<PathBuf>> {
@@ -160,7 +167,7 @@ impl VcsBackend for Libgit2Backend {
         commit_ids: &[String],
         highlighter: &SyntaxHighlighter,
     ) -> Result<Vec<DiffFile>> {
-        diff::get_commit_range_diff(&self.repo, commit_ids, highlighter)
+        diff::get_commit_range_diff(&self.repo, commit_ids, self.whitespace_mode, highlighter)
     }
 
     fn get_commits_info(&self, ids: &[String]) -> Result<Vec<CommitInfo>> {
@@ -184,7 +191,12 @@ impl VcsBackend for Libgit2Backend {
         commit_ids: &[String],
         highlighter: &SyntaxHighlighter,
     ) -> Result<Vec<DiffFile>> {
-        diff::get_working_tree_with_commits_diff(&self.repo, commit_ids, highlighter)
+        diff::get_working_tree_with_commits_diff(
+            &self.repo,
+            commit_ids,
+            self.whitespace_mode,
+            highlighter,
+        )
     }
 
     fn stage_file(&self, path: &Path) -> Result<()> {
@@ -255,7 +267,7 @@ mod tests {
         );
 
         // when
-        let backend = Libgit2Backend::discover_from(&worktree)
+        let backend = Libgit2Backend::discover_from(&worktree, DiffWhitespaceMode::Normal)
             .expect("worktree with relativeworktrees extension should open");
 
         // then

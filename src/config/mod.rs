@@ -45,6 +45,7 @@ pub struct AppConfig {
     pub comment_types: Option<Vec<CommentTypeConfig>>,
     pub show_file_list: Option<bool>,
     pub diff_view: Option<String>,
+    pub ignore_whitespace: Option<bool>,
     pub wrap: Option<bool>,
     pub export_legend: Option<bool>,
     pub cursor_line: Option<bool>,
@@ -77,6 +78,7 @@ const KNOWN_KEYS: &[&str] = &[
     "comment_types",
     "show_file_list",
     "diff_view",
+    "ignore_whitespace",
     "wrap",
     "export_legend",
     "cursor_line",
@@ -285,6 +287,7 @@ fn load_config_from_path(path: &Path) -> Result<ConfigLoadOutcome> {
             &["unified", "side-by-side"],
             &mut warnings,
         ),
+        ignore_whitespace: read_bool(table, "ignore_whitespace", &mut warnings),
         wrap: read_bool(table, "wrap", &mut warnings),
         export_legend: read_bool(table, "export_legend", &mut warnings),
         cursor_line: read_bool(table, "cursor_line", &mut warnings),
@@ -757,6 +760,51 @@ mod tests {
         assert_eq!(
             outcome.warnings[0],
             "Warning: Config key 'diff_view' must be a string; ignoring value"
+        );
+    }
+
+    // ignore_whitespace
+
+    #[test]
+    fn should_parse_ignore_whitespace_true() {
+        let outcome = parse_config("ignore_whitespace = true\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.ignore_whitespace),
+            Some(true)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_parse_ignore_whitespace_false() {
+        let outcome = parse_config("ignore_whitespace = false\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.ignore_whitespace),
+            Some(false)
+        );
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
+    fn should_warn_and_ignore_ignore_whitespace_with_invalid_type() {
+        let outcome = parse_config("ignore_whitespace = \"yes\"\n");
+        assert_eq!(
+            outcome
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.ignore_whitespace),
+            None
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0],
+            "Warning: Config key 'ignore_whitespace' must be a boolean; ignoring value"
         );
     }
 

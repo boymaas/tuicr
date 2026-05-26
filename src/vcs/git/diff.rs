@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use crate::error::{Result, TuicrError};
 use crate::model::{DiffFile, DiffHunk, DiffLine, FileStatus, LineOrigin};
 use crate::syntax::{SyntaxHighlighter, needs_full_file_highlight};
-use crate::vcs::traits::ChangeKind;
+use crate::vcs::traits::{ChangeKind, DiffWhitespaceMode};
 use crate::vcs::{enhance_with_full_file_highlight, tabify};
 
 pub fn get_working_tree_diff(
     repo: &Repository,
+    whitespace_mode: DiffWhitespaceMode,
     highlighter: &SyntaxHighlighter,
 ) -> Result<Vec<DiffFile>> {
     // Unborn HEAD (fresh `git init` / `git clone` of an empty remote) has no
@@ -16,7 +17,7 @@ pub fn get_working_tree_diff(
     // staged/added files still surface in the working-tree review.
     let head = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
 
-    let mut opts = DiffOptions::new();
+    let mut opts = diff_options(whitespace_mode);
     opts.include_untracked(true);
     opts.show_untracked_content(true);
     opts.recurse_untracked_dirs(true);
@@ -39,11 +40,14 @@ pub fn get_working_tree_diff(
 /// On repos with no commits (unborn HEAD), diffs against an empty tree.
 pub fn get_staged_diff(
     repo: &Repository,
+    whitespace_mode: DiffWhitespaceMode,
     highlighter: &SyntaxHighlighter,
 ) -> Result<Vec<DiffFile>> {
     let head = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let index = repo.index()?;
-    let diff = repo.diff_tree_to_index(head.as_ref(), Some(&index), None)?;
+    let mut opts = diff_options(whitespace_mode);
+
+    let diff = repo.diff_tree_to_index(head.as_ref(), Some(&index), Some(&mut opts))?;
     let mut files = parse_diff(&diff, highlighter)?;
     enhance_with_full_file_highlight(
         &mut files,
@@ -67,11 +71,12 @@ pub fn list_changed_paths(repo: &Repository, kind: ChangeKind) -> Result<Vec<Pat
         ChangeKind::Staged => {
             let head = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
             let index = repo.index()?;
-            repo.diff_tree_to_index(head.as_ref(), Some(&index), None)?
+            let mut opts = diff_options(DiffWhitespaceMode::Normal);
+            repo.diff_tree_to_index(head.as_ref(), Some(&index), Some(&mut opts))?
         }
         ChangeKind::Unstaged => {
             let index = repo.index()?;
-            let mut opts = DiffOptions::new();
+            let mut opts = diff_options(DiffWhitespaceMode::Normal);
             opts.include_untracked(true);
             // `show_untracked_content(false)` keeps libgit2 from reading each
             // untracked file's bytes — only the paths are needed here.
@@ -98,10 +103,11 @@ pub fn list_changed_paths(repo: &Repository, kind: ChangeKind) -> Result<Vec<Pat
 
 pub fn get_unstaged_diff(
     repo: &Repository,
+    whitespace_mode: DiffWhitespaceMode,
     highlighter: &SyntaxHighlighter,
 ) -> Result<Vec<DiffFile>> {
     let index = repo.index()?;
-    let mut opts = DiffOptions::new();
+    let mut opts = diff_options(whitespace_mode);
     opts.include_untracked(true);
     opts.show_untracked_content(true);
     opts.recurse_untracked_dirs(true);
@@ -123,6 +129,7 @@ pub fn get_unstaged_diff(
 pub fn get_commit_range_diff(
     repo: &Repository,
     commit_ids: &[String],
+    whitespace_mode: DiffWhitespaceMode,
     highlighter: &SyntaxHighlighter,
 ) -> Result<Vec<DiffFile>> {
     if commit_ids.is_empty() {
@@ -143,7 +150,9 @@ pub fn get_commit_range_diff(
 
     let new_tree = newest_commit.tree()?;
 
-    let diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)?;
+    let mut opts = diff_options(whitespace_mode);
+
+    let diff = repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut opts))?;
     let mut files = parse_diff(&diff, highlighter)?;
     enhance_with_full_file_highlight(
         &mut files,
@@ -163,6 +172,7 @@ pub fn get_commit_range_diff(
 pub fn get_working_tree_with_commits_diff(
     repo: &Repository,
     commit_ids: &[String],
+    whitespace_mode: DiffWhitespaceMode,
     highlighter: &SyntaxHighlighter,
 ) -> Result<Vec<DiffFile>> {
     if commit_ids.is_empty() {
@@ -178,7 +188,7 @@ pub fn get_working_tree_with_commits_diff(
         None
     };
 
-    let mut opts = DiffOptions::new();
+    let mut opts = diff_options(whitespace_mode);
     opts.include_untracked(true);
     opts.show_untracked_content(true);
     opts.recurse_untracked_dirs(true);
@@ -196,6 +206,12 @@ pub fn get_working_tree_with_commits_diff(
         |path| read_path_from_workdir(repo, path),
     );
     Ok(files)
+}
+
+fn diff_options(whitespace_mode: DiffWhitespaceMode) -> DiffOptions {
+    let mut opts = DiffOptions::new();
+    opts.ignore_whitespace(whitespace_mode.ignores_all());
+    opts
 }
 
 fn read_path_from_tree(repo: &Repository, tree: &git2::Tree, path: &Path) -> Option<String> {
@@ -410,8 +426,12 @@ mod tests {
         )
         .expect("failed to update file");
 
-        let files = get_working_tree_diff(&repo, &SyntaxHighlighter::default())
-            .expect("failed to get diff");
+        let files = get_working_tree_diff(
+            &repo,
+            DiffWhitespaceMode::Normal,
+            &SyntaxHighlighter::default(),
+        )
+        .expect("failed to get diff");
 
         assert_eq!(files.len(), 1);
         let lines = &files[0].hunks[0].lines;
@@ -434,8 +454,12 @@ mod tests {
         let edited = "<template>\n  <div>{{ msg }}</div>\n</template>\n\n<script setup>\nimport { ref } from 'vue'\nconst msg = ref('hello')\nconst other = 1\n</script>\n";
         fs::write(temp_dir.path().join("App.vue"), edited).expect("failed to update file");
 
-        let files = get_working_tree_diff(&repo, &SyntaxHighlighter::default())
-            .expect("failed to get diff");
+        let files = get_working_tree_diff(
+            &repo,
+            DiffWhitespaceMode::Normal,
+            &SyntaxHighlighter::default(),
+        )
+        .expect("failed to get diff");
         assert_eq!(files.len(), 1);
 
         let changed_lines: Vec<_> = files[0].hunks[0]
@@ -470,10 +494,11 @@ mod tests {
 
         let highlighter = SyntaxHighlighter::default();
 
-        let unstaged = get_unstaged_diff(&repo, &highlighter).expect("unstaged diff failed");
+        let unstaged = get_unstaged_diff(&repo, DiffWhitespaceMode::Normal, &highlighter)
+            .expect("unstaged diff failed");
         assert_eq!(unstaged.len(), 1);
         assert!(matches!(
-            get_staged_diff(&repo, &highlighter),
+            get_staged_diff(&repo, DiffWhitespaceMode::Normal, &highlighter),
             Err(TuicrError::NoChanges)
         ));
 
@@ -483,10 +508,11 @@ mod tests {
             .expect("failed to add file to index");
         index.write().expect("failed to write index");
 
-        let staged = get_staged_diff(&repo, &highlighter).expect("staged diff failed");
+        let staged = get_staged_diff(&repo, DiffWhitespaceMode::Normal, &highlighter)
+            .expect("staged diff failed");
         assert_eq!(staged.len(), 1);
         assert!(matches!(
-            get_unstaged_diff(&repo, &highlighter),
+            get_unstaged_diff(&repo, DiffWhitespaceMode::Normal, &highlighter),
             Err(TuicrError::NoChanges)
         ));
     }
@@ -503,13 +529,73 @@ mod tests {
         index.write().expect("write index");
 
         // when
-        let files = get_working_tree_diff(&repo, &SyntaxHighlighter::default())
-            .expect("unborn HEAD should produce a diff against an empty tree");
+        let files = get_working_tree_diff(
+            &repo,
+            DiffWhitespaceMode::Normal,
+            &SyntaxHighlighter::default(),
+        )
+        .expect("unborn HEAD should produce a diff against an empty tree");
 
         // then the staged file shows up as an addition rather than crashing
         // with `reference 'refs/heads/main' not found`
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].display_path(), Path::new("file.txt"));
         assert!(matches!(files[0].status, FileStatus::Added));
+    }
+
+    #[test]
+    fn should_surface_noop_file_when_whitespace_only_diff_is_empty() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let repo = Repository::init(temp_dir.path()).expect("failed to init repo");
+
+        create_initial_commit(&repo, "file.txt", "alpha\nbeta\n");
+        fs::write(temp_dir.path().join("file.txt"), " alpha \n beta\n")
+            .expect("failed to update file");
+
+        let files = get_working_tree_diff(
+            &repo,
+            DiffWhitespaceMode::IgnoreAll,
+            &SyntaxHighlighter::default(),
+        )
+        .expect("whitespace-only edit may surface as a no-op diff file");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].hunks.is_empty());
+
+        fs::write(temp_dir.path().join("file.txt"), " alpha \ngamma\n")
+            .expect("failed to update file");
+
+        let files = get_working_tree_diff(
+            &repo,
+            DiffWhitespaceMode::IgnoreAll,
+            &SyntaxHighlighter::default(),
+        )
+        .expect("non-whitespace edit should still produce a diff");
+        assert_eq!(files.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_keep_mode_only_changes_when_ignoring_whitespace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let repo = Repository::init(temp_dir.path()).expect("failed to init repo");
+        create_initial_commit(&repo, "file.txt", "alpha\n");
+
+        let path = temp_dir.path().join("file.txt");
+        let mut permissions = fs::metadata(&path)
+            .expect("failed to stat file")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("failed to update mode");
+
+        let files = get_working_tree_diff(
+            &repo,
+            DiffWhitespaceMode::IgnoreAll,
+            &SyntaxHighlighter::default(),
+        )
+        .expect("mode-only edit should still produce a diff");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].hunks.is_empty());
     }
 }

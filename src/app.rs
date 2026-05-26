@@ -22,8 +22,8 @@ use crate::update::UpdateInfo;
 use crate::vcs::git::calculate_gap;
 use crate::vcs::traits::VcsType;
 use crate::vcs::{
-    ChangeKind, CommitInfo, FileBackend, GitBackendPreference, PrNoopVcs, VcsBackend,
-    VcsChangeStatus, VcsInfo, detect_vcs,
+    ChangeKind, CommitInfo, DiffWhitespaceMode, FileBackend, GitBackendPreference, PrNoopVcs,
+    VcsBackend, VcsChangeStatus, VcsInfo, detect_vcs,
 };
 
 const VISIBLE_COMMIT_COUNT: usize = 10;
@@ -1279,6 +1279,7 @@ pub struct AppStartupOptions<'a> {
     /// the other selectors; the binary validates that before reaching here.
     pub all_files: bool,
     pub git_backend_preference: GitBackendPreference,
+    pub diff_whitespace_mode: DiffWhitespaceMode,
     /// Direct PR target (`tuicr pr <target>`). Mutually exclusive with the
     /// other selectors above; the binary validates that before reaching here.
     pub pr_target: Option<&'a str>,
@@ -1410,7 +1411,7 @@ impl App {
         }
 
         let vcs = crate::profile::time("startup.detect_vcs", || {
-            detect_vcs(options.git_backend_preference)
+            detect_vcs(options.git_backend_preference, options.diff_whitespace_mode)
         })?;
         let vcs_info = vcs.info().clone();
         let highlighter =

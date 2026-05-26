@@ -175,6 +175,7 @@ Path: `~/.config/tuicr/config.toml` on Linux/macOS, `%APPDATA%\tuicr\config.toml
 ```toml
 theme = "catppuccin-mocha"
 diff_view = "side-by-side"   # or "unified"
+ignore_whitespace = false    # ignore all whitespace in local VCS diffs
 appearance = "system"        # or "dark" / "light"
 mouse = true
 leader = ";"                  # configurable prefix for leader shortcuts

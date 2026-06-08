@@ -9111,6 +9111,49 @@ impl App {
         self.file_line_count_cache.clear();
     }
 
+    /// Toggle full-file view for the current file: expand every gap (leading,
+    /// inter-hunk, and EOF) so the whole source shows inline, or collapse them
+    /// all back to just the diff hunks.
+    pub fn toggle_full_file(&mut self) {
+        let file_idx = self.diff_state.current_file_idx;
+        let Some(file) = self.diff_files.get(file_idx) else {
+            return;
+        };
+        let hunk_count = file.hunks.len();
+        if hunk_count == 0 {
+            self.set_message("No hunks to expand");
+            return;
+        }
+
+        let last_gap = if self.eof_gap_enabled() {
+            hunk_count
+        } else {
+            hunk_count.saturating_sub(1)
+        };
+        let gaps: Vec<GapId> = (0..=last_gap)
+            .map(|hunk_idx| GapId { file_idx, hunk_idx })
+            .collect();
+
+        let already_expanded = gaps.iter().any(|g| {
+            self.expanded_top.contains_key(g) || self.expanded_bottom.contains_key(g)
+        });
+
+        if already_expanded {
+            for gap in gaps {
+                self.collapse_gap(gap);
+            }
+            self.set_message("Collapsed to diff");
+        } else {
+            for gap in gaps {
+                if let Err(e) = self.expand_gap(gap, ExpandDirection::Both, None) {
+                    self.set_error(format!("Full file expand failed: {e}"));
+                    return;
+                }
+            }
+            self.set_message("Full file shown");
+        }
+    }
+
     fn eof_gap_enabled(&self) -> bool {
         matches!(
             self.diff_source,
@@ -13028,6 +13071,40 @@ mod expand_gap_tests {
         assert_eq!(content.len(), 50);
         assert_eq!(content[0].new_lineno, Some(1));
         assert_eq!(content[49].new_lineno, Some(50));
+    }
+
+    #[test]
+    fn should_expand_every_gap_on_full_file_toggle() {
+        // given: two hunks (51..55, 80..84) in a 100-line file, leaving a
+        // leading gap, a between-hunk gap, and an EOF gap
+        let file = make_file_with_hunks("test.rs", vec![make_hunk(51, 5), make_hunk(80, 5)]);
+        let mut app = build_app_with_files(vec![file], 100);
+
+        // when: toggle full file
+        app.toggle_full_file();
+
+        // then: leading gap (1..50), between gap (56..79), and EOF gap (85..100)
+        // are all fully expanded
+        let leading = GapId { file_idx: 0, hunk_idx: 0 };
+        let between = GapId { file_idx: 0, hunk_idx: 1 };
+        let eof = GapId { file_idx: 0, hunk_idx: 2 };
+        assert_eq!(app.expanded_top.get(&leading).unwrap().len(), 50);
+        assert_eq!(app.expanded_top.get(&between).unwrap().len(), 24);
+        assert_eq!(app.expanded_top.get(&eof).unwrap().len(), 16);
+        assert_eq!(app.message.as_ref().unwrap().content, "Full file shown");
+    }
+
+    #[test]
+    fn should_collapse_every_gap_on_second_full_file_toggle() {
+        let file = make_file_with_hunks("test.rs", vec![make_hunk(51, 5), make_hunk(80, 5)]);
+        let mut app = build_app_with_files(vec![file], 100);
+
+        app.toggle_full_file();
+        app.toggle_full_file();
+
+        assert!(app.expanded_top.is_empty());
+        assert!(app.expanded_bottom.is_empty());
+        assert_eq!(app.message.as_ref().unwrap().content, "Collapsed to diff");
     }
 
     #[test]

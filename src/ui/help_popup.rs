@@ -121,6 +121,13 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  zf        ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Toggle full file (expand all context)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  Tab/S-Tab ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),

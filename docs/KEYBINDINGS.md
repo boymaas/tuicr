@@ -22,6 +22,7 @@ Full reference. Press `?` inside tuicr for an in-app version of this list.
 | `/` | Search within diff |
 | `n` / `N` | Next / previous search match |
 | `Enter` | Expand or collapse hidden context between hunks |
+| `zf` | Toggle full file (expand/collapse all context in current file) |
 | `zt` | Scroll cursor to top of screen |
 | `zz` | Center cursor on screen |
 | `zb` | Scroll cursor to bottom of screen |
@@ -105,6 +106,7 @@ In command mode,
 | `:edit` | Open focused file in `$EDITOR` |
 | `:clip` (`:export`) | Copy review to clipboard |
 | `:diff` | Toggle diff view (unified / side-by-side) |
+| `:full` | Toggle full file (expand/collapse all context in current file) |
 | `:commits` | Select commits to review |
 | `:submit` | Open submit picker (Comment / Approve / Request changes / Draft) |
 | `:submit comment` | Submit a Comment review |

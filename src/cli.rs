@@ -39,7 +39,7 @@ pub struct CliArgs {
 #[derive(Parser, Debug)]
 #[command(
     name = "tuicr",
-    version,
+    version = crate::FORK_VERSION,
     about = "A code review TUI with vim keybindings. Export to GitHub or clipboard.",
     after_help = "Press ? in the application for keybinding help.",
     disable_help_subcommand = true

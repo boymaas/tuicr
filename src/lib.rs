@@ -24,6 +24,10 @@ pub mod ui;
 pub mod update;
 pub mod vcs;
 
+/// Version string including a fork marker, so `--version` and `:version` make
+/// clear this is the boymaas fork rather than upstream tuicr.
+pub const FORK_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (boymaas fork)");
+
 pub use error::{Result, TuicrError};
 pub use model::{Comment, CommentType, LineRange, LineSide, ReviewSession, SessionDiffSource};
 pub use review_store::{

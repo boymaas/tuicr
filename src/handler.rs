@@ -760,7 +760,7 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
             CommandAfterDispatch::KeepMode
         }
         CommandKind::Version => {
-            app.set_message(format!("tuicr v{}", env!("CARGO_PKG_VERSION")));
+            app.set_message(format!("tuicr v{}", crate::FORK_VERSION));
             CommandAfterDispatch::ExitCommandMode
         }
         CommandKind::Update => {

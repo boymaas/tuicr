@@ -415,6 +415,10 @@ fn main() -> anyhow::Result<()> {
                                 app.cursor_to_bottom();
                                 continue;
                             }
+                            crossterm::event::KeyCode::Char('f') => {
+                                app.toggle_full_file();
+                                continue;
+                            }
                             _ => {} // Fall through to normal handling
                         }
                     }

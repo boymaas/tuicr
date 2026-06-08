@@ -42,6 +42,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec::new(&["set commits!"], CommandKind::ToggleCommits),
     CommandSpec::new(&["diff"], CommandKind::Diff),
     CommandSpec::new(&["focus", "f"], CommandKind::Focus),
+    CommandSpec::new(&["full"], CommandKind::FullFile),
     CommandSpec::new(&["stage"], CommandKind::Stage),
     CommandSpec::new(
         &["commits", "targets"],
@@ -111,6 +112,7 @@ enum CommandKind {
     ToggleCommits,
     Diff,
     Focus,
+    FullFile,
     Stage,
     Targets(TargetTab),
     SubmitPicker,
@@ -777,6 +779,10 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
         }
         CommandKind::Focus => {
             app.toggle_single_file_view();
+            CommandAfterDispatch::ExitCommandMode
+        }
+        CommandKind::FullFile => {
+            app.toggle_full_file();
             CommandAfterDispatch::ExitCommandMode
         }
         CommandKind::Stage => {

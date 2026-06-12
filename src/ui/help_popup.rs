@@ -127,6 +127,17 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
             Span::raw("Toggle full file (expand all context)"),
         ]),
         Line::from(vec![
+            Span::styled("  e         ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("Open focused file in $EDITOR at cursor line"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Space     ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Document view: show/hide the cursor hunk's diff"),
+        ]),
+        Line::from(vec![
             Span::styled(
                 "  Tab/S-Tab ",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -606,7 +617,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  :diff     ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Toggle unified/side-by-side diff view"),
+            Span::raw("Cycle diff view: document/unified/side-by-side"),
         ]),
         Line::from(vec![
             Span::styled(

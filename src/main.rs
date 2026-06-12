@@ -247,10 +247,16 @@ fn main() -> anyhow::Result<()> {
             app.show_file_list = false;
             app.focused_panel = FocusedPanel::Diff;
         }
-        // Pristine mode has no diff, so side-by-side would render two
-        // identical panes. Honor the config for every other mode.
-        if cfg.diff_view.as_deref() == Some("side-by-side") && !app.is_pristine_mode {
-            app.diff_view_mode = app::DiffViewMode::SideBySide;
+        // Pristine mode has no diff, so side-by-side / document views have
+        // nothing to render distinctly; it stays unified (forced in `App::new`).
+        // Every other mode honors the config; the default (unset) is Document.
+        if !app.is_pristine_mode {
+            match cfg.diff_view.as_deref() {
+                Some("side-by-side") => app.diff_view_mode = app::DiffViewMode::SideBySide,
+                Some("unified") => app.diff_view_mode = app::DiffViewMode::Unified,
+                Some("document") => app.diff_view_mode = app::DiffViewMode::Document,
+                _ => {}
+            }
         }
         if let Some(wrap) = cfg.wrap {
             app.diff_state.wrap_lines = wrap;
@@ -260,6 +266,13 @@ fn main() -> anyhow::Result<()> {
         // only toggle if it's still off.
         if cfg.single_file_view == Some(true) && !app.is_single_file_view {
             app.toggle_single_file_view();
+        }
+        // Document view is a single-file "buffer" of the whole file. Pin
+        // single-file view and expand the current file's full content up front
+        // (covers both the default and an explicit `diff_view = "document"`).
+        if app.diff_view_mode == app::DiffViewMode::Document && !app.is_pristine_mode {
+            app.is_single_file_view = true;
+            app.ensure_document_full_file();
         }
         if cfg.export_legend == Some(false) {
             app.export_legend = false;

@@ -42,7 +42,9 @@ pub(super) fn diff_visible_range(app: &App, inner: Rect) -> (usize, usize) {
 
 pub(super) fn render_diff_view(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.diff_view_mode {
-        DiffViewMode::Unified => render_unified_diff(frame, app, area),
+        // Document shares the single-column walk; it switches the per-line
+        // drawing internally based on `app.diff_view_mode`.
+        DiffViewMode::Unified | DiffViewMode::Document => render_unified_diff(frame, app, area),
         DiffViewMode::SideBySide => render_side_by_side_diff(frame, app, area),
     }
 }

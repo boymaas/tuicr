@@ -284,7 +284,7 @@ fn load_config_from_path(path: &Path) -> Result<ConfigLoadOutcome> {
         diff_view: read_enum(
             table,
             "diff_view",
-            &["unified", "side-by-side"],
+            &["unified", "side-by-side", "document"],
             &mut warnings,
         ),
         ignore_whitespace: read_bool(table, "ignore_whitespace", &mut warnings),

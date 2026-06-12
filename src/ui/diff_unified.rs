@@ -8,7 +8,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, DiffSource, ExpandDirection, FocusedPanel, GAP_EXPAND_BATCH, GapId, InputMode,
+    App, DiffSource, DiffViewMode, ExpandDirection, FocusedPanel, GAP_EXPAND_BATCH, GapId,
+    InputMode,
 };
 use crate::forge::remote_comments::PrCommentsVisibility;
 use crate::model::{FileStatus, LineOrigin, LineRange, LineSide};
@@ -44,8 +45,10 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
     app.diff_state.viewport_height = inner.height as usize;
     app.diff_inner_area = Some(inner);
 
-    // Reset comment input annotation offset (will be set if a comment input box is rendered)
-    app.comment_input_annotation_offset = None;
+    // Comment-input annotation offset is accumulated locally so per-line
+    // comment rendering can run against a shared `&App` borrow (the file walk
+    // holds `&app.diff_files`); it's committed to `app` once after the walk.
+    let mut comment_input_offset: Option<(usize, usize, usize)> = None;
 
     let lw = app.lineno_width();
 
@@ -130,7 +133,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
             comment_input_box_range =
                 Some((line_idx, line_idx + input_lines.len().saturating_sub(1)));
             let annotations_replaced = App::comment_display_lines(comment, inner.width as usize);
-            app.comment_input_annotation_offset =
+            comment_input_offset =
                 Some((line_idx, input_lines.len(), annotations_replaced));
 
             for mut input_line in input_lines {
@@ -204,7 +207,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
         comment_cursor_column = 1 + cursor_info.column;
         comment_input_box_range = Some((line_idx, line_idx + input_lines.len().saturating_sub(1)));
-        app.comment_input_annotation_offset = Some((line_idx, input_lines.len(), 0));
+        comment_input_offset = Some((line_idx, input_lines.len(), 0));
 
         for mut input_line in input_lines {
             let indicator = cursor_indicator(line_idx, current_line_idx);
@@ -305,7 +308,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                         Some((line_idx, line_idx + input_lines.len().saturating_sub(1)));
                     let annotations_replaced =
                         App::comment_display_lines(comment, inner.width as usize);
-                    app.comment_input_annotation_offset =
+                    comment_input_offset =
                         Some((line_idx, input_lines.len(), annotations_replaced));
 
                     for mut input_line in input_lines {
@@ -361,7 +364,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
             comment_cursor_column = 1 + cursor_info.column;
             comment_input_box_range =
                 Some((line_idx, line_idx + input_lines.len().saturating_sub(1)));
-            app.comment_input_annotation_offset = Some((line_idx, input_lines.len(), 0));
+            comment_input_offset = Some((line_idx, input_lines.len(), 0));
 
             for mut input_line in input_lines {
                 let indicator = cursor_indicator(line_idx, current_line_idx);
@@ -535,13 +538,45 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                     continue;
                 }
 
-                // Diff lines
-                for diff_line in &hunk.lines {
+                // Diff lines. Document view classifies each line into gutter
+                // signs and hides deletions until the hunk is revealed; unified
+                // draws every line with the classic +/- prefix.
+                let doc_sign_for = if app.diff_view_mode == DiffViewMode::Document {
+                    let revealed = app.revealed_hunks.contains(&(file_idx, hunk_idx));
+                    let rows = crate::ui::diff_document::compute_hunk_signs(&hunk.lines, revealed);
+                    let mut per_line: Vec<Option<crate::ui::diff_document::DocRow>> =
+                        vec![None; hunk.lines.len()];
+                    for r in rows {
+                        per_line[r.line_idx] = Some(r);
+                    }
+                    Some(per_line)
+                } else {
+                    None
+                };
+
+                for (li, diff_line) in hunk.lines.iter().enumerate() {
                     // Hot path: skip span/style allocation entirely for diff
                     // lines outside the viewport. Comment handling below still
                     // runs so `line_idx` stays exact and any comment box that
                     // crosses into the viewport is rendered.
-                    if line_idx < visible_start || line_idx >= visible_end {
+                    if let Some(per_line) = &doc_sign_for {
+                        // Document view: hidden deletions produce no row and no
+                        // comment anchor; emitted lines draw a gutter-sign row.
+                        let Some(row) = per_line[li] else {
+                            continue;
+                        };
+                        crate::ui::diff_document::render_document_line(
+                            &mut lines,
+                            &mut line_idx,
+                            current_line_idx,
+                            diff_line,
+                            row,
+                            &app.theme,
+                            lw,
+                            visible_start,
+                            visible_end,
+                        );
+                    } else if line_idx < visible_start || line_idx >= visible_end {
                         lines.push(Line::default());
                         line_idx += 1;
                     } else {
@@ -620,323 +655,51 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                         line_idx += 1;
                     }
 
-                    // Show line comments for both old side (deleted lines) and new side (added/context)
-                    // Old side comments (for deleted lines)
+                    // Inline comments, remote threads, and new-comment input
+                    // anchored at this diff line. Old-side anchors carry deletion
+                    // comments; new-side anchors carry everything else.
+                    let mut cc: Option<(usize, u16)> = None;
                     if let Some(old_ln) = diff_line.old_lineno {
-                        // Check if we're adding/editing a comment on this line (old side)
-                        let is_line_comment_mode = app.input_mode == InputMode::Comment
-                            && !app.comment_is_file_level
-                            && file_idx == app.diff_state.current_file_idx
-                            && app.comment_line == Some((old_ln, LineSide::Old));
-
-                        if let Some(comments) = line_comments.get(&old_ln) {
-                            for comment in comments {
-                                if comment.side == Some(LineSide::Old) {
-                                    // Skip if this comment is being edited
-                                    let is_being_edited = is_line_comment_mode
-                                        && app.editing_comment_id.as_ref() == Some(&comment.id);
-
-                                    if is_being_edited {
-                                        let line_range = app
-                                            .comment_line_range
-                                            .map(|(r, _)| r)
-                                            .or_else(|| Some(LineRange::single(old_ln)));
-                                        let (input_lines, cursor_info) =
-                                            comment_panel::format_comment_input_lines(
-                                                &app.theme,
-                                                comment_type_presentation(app, &app.comment_type),
-                                                &app.comment_buffer,
-                                                app.comment_cursor,
-                                                line_range,
-                                                true,
-                                                comment_width,
-                                            );
-                                        comment_cursor_logical_line =
-                                            Some(line_idx + cursor_info.line_offset);
-                                        comment_cursor_column = 1 + cursor_info.column;
-                                        let box_top_row = line_idx;
-                                        comment_input_box_range = Some((
-                                            line_idx,
-                                            line_idx + input_lines.len().saturating_sub(1),
-                                        ));
-                                        let annotations_replaced = App::comment_display_lines(
-                                            comment,
-                                            inner.width as usize,
-                                        );
-                                        app.comment_input_annotation_offset = Some((
-                                            line_idx,
-                                            input_lines.len(),
-                                            annotations_replaced,
-                                        ));
-
-                                        for mut input_line in input_lines {
-                                            let indicator =
-                                                cursor_indicator(line_idx, current_line_idx);
-                                            input_line.spans.insert(
-                                                0,
-                                                Span::styled(
-                                                    indicator,
-                                                    styles::current_line_indicator_style(
-                                                        &app.theme,
-                                                    ),
-                                                ),
-                                            );
-                                            lines.push(input_line);
-                                            line_idx += 1;
-                                        }
-                                        push_comment_bar(
-                                            &mut comment_bars,
-                                            box_top_row,
-                                            line_range,
-                                        );
-                                    } else {
-                                        let line_range = comment
-                                            .line_range
-                                            .or_else(|| Some(LineRange::single(old_ln)));
-                                        let comment_lines = comment_panel::format_comment_lines(
-                                            &app.theme,
-                                            comment_type_presentation(app, &comment.comment_type),
-                                            &comment.content,
-                                            line_range,
-                                            comment_width,
-                                            (comment.author != app.username)
-                                                .then_some(comment.author.as_str()),
-                                        );
-                                        let box_top_row = line_idx;
-                                        for mut comment_line in comment_lines {
-                                            let is_current = line_idx == current_line_idx;
-                                            let indicator = if is_current { "▶" } else { " " };
-                                            comment_line.spans.insert(
-                                                0,
-                                                Span::styled(
-                                                    indicator,
-                                                    styles::current_line_indicator_style(
-                                                        &app.theme,
-                                                    ),
-                                                ),
-                                            );
-                                            lines.push(comment_line);
-                                            line_idx += 1;
-                                        }
-                                        push_comment_bar(
-                                            &mut comment_bars,
-                                            box_top_row,
-                                            line_range,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Render remote review threads anchored at this old-side line.
-                        render_remote_threads_for_anchor(
+                        render_line_comments_for_anchor(
                             &mut lines,
                             &mut line_idx,
                             current_line_idx,
                             app,
                             path,
+                            file_idx,
                             old_ln,
                             LineSide::Old,
+                            line_comments,
+                            comment_width,
+                            inner.width as usize,
                             &mut comment_bars,
+                            &mut cc,
+                            &mut comment_input_box_range,
+                            &mut comment_input_offset,
                         );
-
-                        // Render inline input for new line comment (old side)
-                        if is_line_comment_mode && app.editing_comment_id.is_none() {
-                            let line_range = app
-                                .comment_line_range
-                                .map(|(r, _)| r)
-                                .or_else(|| Some(LineRange::single(old_ln)));
-                            let (input_lines, cursor_info) =
-                                comment_panel::format_comment_input_lines(
-                                    &app.theme,
-                                    comment_type_presentation(app, &app.comment_type),
-                                    &app.comment_buffer,
-                                    app.comment_cursor,
-                                    line_range,
-                                    false,
-                                    comment_width,
-                                );
-                            comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
-                            comment_cursor_column = 1 + cursor_info.column;
-                            let box_top_row = line_idx;
-                            comment_input_box_range =
-                                Some((line_idx, line_idx + input_lines.len().saturating_sub(1)));
-                            app.comment_input_annotation_offset =
-                                Some((line_idx, input_lines.len(), 0));
-
-                            for mut input_line in input_lines {
-                                let indicator = cursor_indicator(line_idx, current_line_idx);
-                                input_line.spans.insert(
-                                    0,
-                                    Span::styled(
-                                        indicator,
-                                        styles::current_line_indicator_style(&app.theme),
-                                    ),
-                                );
-                                lines.push(input_line);
-                                line_idx += 1;
-                            }
-                            push_comment_bar(&mut comment_bars, box_top_row, line_range);
-                        }
                     }
-
-                    // New side comments (for added/context lines)
                     if let Some(new_ln) = diff_line.new_lineno {
-                        // Check if we're adding/editing a comment on this line (new side)
-                        let is_line_comment_mode = app.input_mode == InputMode::Comment
-                            && !app.comment_is_file_level
-                            && file_idx == app.diff_state.current_file_idx
-                            && app.comment_line == Some((new_ln, LineSide::New));
-
-                        if let Some(comments) = line_comments.get(&new_ln) {
-                            for comment in comments {
-                                if comment.side != Some(LineSide::Old) {
-                                    // Skip if this comment is being edited
-                                    let is_being_edited = is_line_comment_mode
-                                        && app.editing_comment_id.as_ref() == Some(&comment.id);
-
-                                    if is_being_edited {
-                                        let line_range = app
-                                            .comment_line_range
-                                            .map(|(r, _)| r)
-                                            .or_else(|| Some(LineRange::single(new_ln)));
-                                        let (input_lines, cursor_info) =
-                                            comment_panel::format_comment_input_lines(
-                                                &app.theme,
-                                                comment_type_presentation(app, &app.comment_type),
-                                                &app.comment_buffer,
-                                                app.comment_cursor,
-                                                line_range,
-                                                true,
-                                                comment_width,
-                                            );
-                                        comment_cursor_logical_line =
-                                            Some(line_idx + cursor_info.line_offset);
-                                        comment_cursor_column = 1 + cursor_info.column;
-                                        let box_top_row = line_idx;
-                                        comment_input_box_range = Some((
-                                            line_idx,
-                                            line_idx + input_lines.len().saturating_sub(1),
-                                        ));
-                                        let annotations_replaced = App::comment_display_lines(
-                                            comment,
-                                            inner.width as usize,
-                                        );
-                                        app.comment_input_annotation_offset = Some((
-                                            line_idx,
-                                            input_lines.len(),
-                                            annotations_replaced,
-                                        ));
-
-                                        for mut input_line in input_lines {
-                                            let indicator =
-                                                cursor_indicator(line_idx, current_line_idx);
-                                            input_line.spans.insert(
-                                                0,
-                                                Span::styled(
-                                                    indicator,
-                                                    styles::current_line_indicator_style(
-                                                        &app.theme,
-                                                    ),
-                                                ),
-                                            );
-                                            lines.push(input_line);
-                                            line_idx += 1;
-                                        }
-                                        push_comment_bar(
-                                            &mut comment_bars,
-                                            box_top_row,
-                                            line_range,
-                                        );
-                                    } else {
-                                        let line_range = comment
-                                            .line_range
-                                            .or_else(|| Some(LineRange::single(new_ln)));
-                                        let comment_lines = comment_panel::format_comment_lines(
-                                            &app.theme,
-                                            comment_type_presentation(app, &comment.comment_type),
-                                            &comment.content,
-                                            line_range,
-                                            comment_width,
-                                            (comment.author != app.username)
-                                                .then_some(comment.author.as_str()),
-                                        );
-                                        let box_top_row = line_idx;
-                                        for mut comment_line in comment_lines {
-                                            let indicator =
-                                                cursor_indicator(line_idx, current_line_idx);
-                                            comment_line.spans.insert(
-                                                0,
-                                                Span::styled(
-                                                    indicator,
-                                                    styles::current_line_indicator_style(
-                                                        &app.theme,
-                                                    ),
-                                                ),
-                                            );
-                                            lines.push(comment_line);
-                                            line_idx += 1;
-                                        }
-                                        push_comment_bar(
-                                            &mut comment_bars,
-                                            box_top_row,
-                                            line_range,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Render remote review threads anchored at this new-side line.
-                        render_remote_threads_for_anchor(
+                        render_line_comments_for_anchor(
                             &mut lines,
                             &mut line_idx,
                             current_line_idx,
                             app,
                             path,
+                            file_idx,
                             new_ln,
                             LineSide::New,
+                            line_comments,
+                            comment_width,
+                            inner.width as usize,
                             &mut comment_bars,
+                            &mut cc,
+                            &mut comment_input_box_range,
+                            &mut comment_input_offset,
                         );
-
-                        // Render inline input for new line comment (new side)
-                        if is_line_comment_mode && app.editing_comment_id.is_none() {
-                            let line_range = app
-                                .comment_line_range
-                                .map(|(r, _)| r)
-                                .or_else(|| Some(LineRange::single(new_ln)));
-                            let (input_lines, cursor_info) =
-                                comment_panel::format_comment_input_lines(
-                                    &app.theme,
-                                    comment_type_presentation(app, &app.comment_type),
-                                    &app.comment_buffer,
-                                    app.comment_cursor,
-                                    line_range,
-                                    false,
-                                    comment_width,
-                                );
-                            comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
-                            comment_cursor_column = 1 + cursor_info.column;
-                            let box_top_row = line_idx;
-                            comment_input_box_range =
-                                Some((line_idx, line_idx + input_lines.len().saturating_sub(1)));
-                            app.comment_input_annotation_offset =
-                                Some((line_idx, input_lines.len(), 0));
-
-                            for mut input_line in input_lines {
-                                let indicator = cursor_indicator(line_idx, current_line_idx);
-                                input_line.spans.insert(
-                                    0,
-                                    Span::styled(
-                                        indicator,
-                                        styles::current_line_indicator_style(&app.theme),
-                                    ),
-                                );
-                                lines.push(input_line);
-                                line_idx += 1;
-                            }
-                            push_comment_bar(&mut comment_bars, box_top_row, line_range);
-                        }
+                    }
+                    if let Some((l, c)) = cc {
+                        comment_cursor_logical_line = Some(l);
+                        comment_cursor_column = c;
                     }
                 }
             }
@@ -1052,6 +815,38 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         line_idx += 1;
     }
 
+    // Commit the locally-accumulated comment-input offset now that the
+    // `&app.diff_files` walk borrow is released.
+    app.comment_input_annotation_offset = comment_input_offset;
+
+    paint_single_column_diff(
+        frame,
+        app,
+        inner,
+        lines,
+        comment_bars,
+        comment_input_box_range,
+        comment_cursor_logical_line,
+        comment_cursor_column,
+    );
+}
+
+/// Shared paint tail for the single-column diff renderers (unified +
+/// document): slices the visible window, paints per-row diff backgrounds,
+/// section/cursor/selection overlays, the paragraph itself, and the comment
+/// box overlays, then resolves the IME cursor screen position. Runs after the
+/// `&app.diff_files` walk borrow is released, so `app` is fully mutable here.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_single_column_diff(
+    frame: &mut Frame,
+    app: &mut App,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    comment_bars: Vec<crate::ui::diff_view::CommentBarAnchor>,
+    comment_input_box_range: Option<(usize, usize)>,
+    comment_cursor_logical_line: Option<usize>,
+    comment_cursor_column: u16,
+) {
     // Auto-scroll so the comment input box stays visible while the user types.
     // Without this, adding a comment near the bottom/top of the viewport would
     // place the input box off-screen and the user couldn't see what they type.
@@ -1219,6 +1014,153 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
     }
 }
 
+/// Render every inline artifact anchored at one source line on one side:
+/// existing local comments (or their edit-mode input box), remote review
+/// threads, and the input box for a brand-new comment. Shared by the unified
+/// and document single-column renderers so comment behaviour stays identical.
+///
+/// `comment_cursor` and `comment_input_box_range` are out-params updated when
+/// an input box is rendered, so the caller can place the IME cursor and
+/// auto-scroll the box into view.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_line_comments_for_anchor(
+    lines: &mut Vec<Line<'static>>,
+    line_idx: &mut usize,
+    current_line_idx: usize,
+    app: &App,
+    path: &std::path::Path,
+    file_idx: usize,
+    lineno: u32,
+    side: LineSide,
+    line_comments: &std::collections::HashMap<u32, Vec<crate::model::Comment>>,
+    comment_width: usize,
+    inner_width: usize,
+    comment_bars: &mut Vec<crate::ui::diff_view::CommentBarAnchor>,
+    comment_cursor: &mut Option<(usize, u16)>,
+    comment_input_box_range: &mut Option<(usize, usize)>,
+    comment_input_offset: &mut Option<(usize, usize, usize)>,
+) {
+    let is_line_comment_mode = app.input_mode == InputMode::Comment
+        && !app.comment_is_file_level
+        && file_idx == app.diff_state.current_file_idx
+        && app.comment_line == Some((lineno, side));
+
+    // Old-side anchors carry only deletion comments; new-side anchors carry
+    // everything else. `comment.side == Some(Old)` is the discriminator.
+    let want_old = side == LineSide::Old;
+
+    if let Some(comments) = line_comments.get(&lineno) {
+        for comment in comments {
+            if (comment.side == Some(LineSide::Old)) != want_old {
+                continue;
+            }
+            let is_being_edited =
+                is_line_comment_mode && app.editing_comment_id.as_ref() == Some(&comment.id);
+
+            if is_being_edited {
+                let line_range = app
+                    .comment_line_range
+                    .map(|(r, _)| r)
+                    .or_else(|| Some(LineRange::single(lineno)));
+                let (input_lines, cursor_info) = comment_panel::format_comment_input_lines(
+                    &app.theme,
+                    comment_type_presentation(app, &app.comment_type),
+                    &app.comment_buffer,
+                    app.comment_cursor,
+                    line_range,
+                    true,
+                    comment_width,
+                );
+                *comment_cursor = Some((*line_idx + cursor_info.line_offset, 1 + cursor_info.column));
+                let box_top_row = *line_idx;
+                *comment_input_box_range =
+                    Some((*line_idx, *line_idx + input_lines.len().saturating_sub(1)));
+                let annotations_replaced = App::comment_display_lines(comment, inner_width);
+                *comment_input_offset =
+                    Some((*line_idx, input_lines.len(), annotations_replaced));
+
+                for mut input_line in input_lines {
+                    let indicator = cursor_indicator(*line_idx, current_line_idx);
+                    input_line.spans.insert(
+                        0,
+                        Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
+                    );
+                    lines.push(input_line);
+                    *line_idx += 1;
+                }
+                push_comment_bar(comment_bars, box_top_row, line_range);
+            } else {
+                let line_range = comment
+                    .line_range
+                    .or_else(|| Some(LineRange::single(lineno)));
+                let comment_lines = comment_panel::format_comment_lines(
+                    &app.theme,
+                    comment_type_presentation(app, &comment.comment_type),
+                    &comment.content,
+                    line_range,
+                    comment_width,
+                    (comment.author != app.username).then_some(comment.author.as_str()),
+                );
+                let box_top_row = *line_idx;
+                for mut comment_line in comment_lines {
+                    let indicator = cursor_indicator(*line_idx, current_line_idx);
+                    comment_line.spans.insert(
+                        0,
+                        Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
+                    );
+                    lines.push(comment_line);
+                    *line_idx += 1;
+                }
+                push_comment_bar(comment_bars, box_top_row, line_range);
+            }
+        }
+    }
+
+    render_remote_threads_for_anchor(
+        lines,
+        line_idx,
+        current_line_idx,
+        app,
+        path,
+        lineno,
+        side,
+        comment_bars,
+    );
+
+    // Inline input box for a brand-new comment on this anchor.
+    if is_line_comment_mode && app.editing_comment_id.is_none() {
+        let line_range = app
+            .comment_line_range
+            .map(|(r, _)| r)
+            .or_else(|| Some(LineRange::single(lineno)));
+        let (input_lines, cursor_info) = comment_panel::format_comment_input_lines(
+            &app.theme,
+            comment_type_presentation(app, &app.comment_type),
+            &app.comment_buffer,
+            app.comment_cursor,
+            line_range,
+            false,
+            comment_width,
+        );
+        *comment_cursor = Some((*line_idx + cursor_info.line_offset, 1 + cursor_info.column));
+        let box_top_row = *line_idx;
+        *comment_input_box_range =
+            Some((*line_idx, *line_idx + input_lines.len().saturating_sub(1)));
+        *comment_input_offset = Some((*line_idx, input_lines.len(), 0));
+
+        for mut input_line in input_lines {
+            let indicator = cursor_indicator(*line_idx, current_line_idx);
+            input_line.spans.insert(
+                0,
+                Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
+            );
+            lines.push(input_line);
+            *line_idx += 1;
+        }
+        push_comment_bar(comment_bars, box_top_row, line_range);
+    }
+}
+
 /// Render remote review threads anchored at `(path, line, side)` into the
 /// growing line buffer. No-op when `:comments hide` is active or when no
 /// threads anchor here. Resolved/outdated threads use muted styling per
@@ -1294,7 +1236,7 @@ fn render_remote_threads_for_anchor(
 }
 
 /// Render a single expanded context line (shared by unified + side-by-side via unified path)
-fn render_expanded_context_line(
+pub(super) fn render_expanded_context_line(
     lines: &mut Vec<Line<'_>>,
     line_idx: &mut usize,
     current_line_idx: usize,
@@ -1563,6 +1505,94 @@ mod remote_comments_snapshot_tests {
             .draw(|frame| super::render_unified_diff(frame, app, Rect::new(0, 0, 100, 12)))
             .expect("draw unified diff");
         terminal.backend().buffer().clone()
+    }
+
+    /// Modified file with a context line, a deletion, and an addition so the
+    /// document view has something to hide (the deletion) and reveal.
+    fn change_diff_file() -> DiffFile {
+        let lines = vec![
+            DiffLine {
+                origin: LineOrigin::Context,
+                content: "keep".to_string(),
+                old_lineno: Some(1),
+                new_lineno: Some(1),
+                highlighted_spans: None,
+            },
+            DiffLine {
+                origin: LineOrigin::Deletion,
+                content: "removed".to_string(),
+                old_lineno: Some(2),
+                new_lineno: None,
+                highlighted_spans: None,
+            },
+            DiffLine {
+                origin: LineOrigin::Addition,
+                content: "added".to_string(),
+                old_lineno: None,
+                new_lineno: Some(2),
+                highlighted_spans: None,
+            },
+        ];
+        let hunk = DiffHunk {
+            header: "@@ -1,2 +1,2 @@".to_string(),
+            lines,
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+        };
+        let hunks = vec![hunk];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        DiffFile {
+            old_path: Some(PathBuf::from("src/lib.rs")),
+            new_path: Some(PathBuf::from("src/lib.rs")),
+            status: FileStatus::Modified,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        }
+    }
+
+    #[test]
+    fn document_view_hides_deletions_until_revealed() {
+        let mut app = make_revision_app(vec![change_diff_file()]);
+        app.diff_view_mode = crate::app::DiffViewMode::Document;
+        app.rebuild_annotations();
+
+        // Collapsed: the new-side content shows; the deletion is hidden.
+        let body = body_text(&draw_unified_diff(&mut app));
+        assert!(body.contains("added"), "expected new line in:\n{body}");
+        assert!(body.contains("keep"), "expected context line in:\n{body}");
+        assert!(
+            !body.contains("removed"),
+            "deletion should be hidden in collapsed document view:\n{body}"
+        );
+
+        // Revealing the hunk surfaces the deleted line inline.
+        app.revealed_hunks.insert((0, 0));
+        app.rebuild_annotations();
+        let revealed = body_text(&draw_unified_diff(&mut app));
+        assert!(
+            revealed.contains("removed"),
+            "revealed hunk should show the deletion:\n{revealed}"
+        );
+    }
+
+    #[test]
+    fn document_render_height_matches_annotation_count() {
+        // The renderer re-walks the diff; this guards it against drifting out of
+        // lockstep with the annotation stream in document mode.
+        let mut app = make_revision_app(vec![change_diff_file()]);
+        app.diff_view_mode = crate::app::DiffViewMode::Document;
+        app.rebuild_annotations();
+        let _ = draw_unified_diff(&mut app);
+        // Cursor navigation relies on this invariant; exercising a reveal must
+        // keep it intact too.
+        app.revealed_hunks.insert((0, 0));
+        app.rebuild_annotations();
+        let _ = draw_unified_diff(&mut app);
     }
 
     fn body_text(buffer: &Buffer) -> String {

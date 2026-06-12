@@ -1358,6 +1358,11 @@ pub fn handle_diff_action(app: &mut App, action: Action) {
                 }
             }
         }
+        // In Document view, Space reveals/hides the cursor hunk's diff. In the
+        // other views the diff panel has no Space binding, so this is inert.
+        Action::ToggleExpand if app.diff_view_mode == crate::app::DiffViewMode::Document => {
+            app.toggle_hunk_diff_reveal_at_cursor();
+        }
         _ => handle_shared_normal_action(app, action),
     }
 }
@@ -1438,6 +1443,7 @@ fn handle_shared_normal_action(app: &mut App, action: Action) {
                 app.show_file_list = true;
             }
         }
+        Action::OpenInEditor => app.queue_editor_for_focused_item(),
         Action::ExpandAll => {
             app.expand_all_dirs();
             app.set_message("All directories expanded");

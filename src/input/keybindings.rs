@@ -130,6 +130,9 @@ pub enum Action {
     CollapseAll,
     SelectFileFull,
 
+    /// Open the focused file in `$EDITOR` at the cursor line.
+    OpenInEditor,
+
     // No-op
     None,
 }
@@ -196,6 +199,7 @@ fn map_normal_mode(key: KeyEvent, leader_key: char) -> Action {
         (KeyCode::Char('c'), KeyModifiers::NONE) => Action::AddLineComment,
         (KeyCode::Char('C'), _) => Action::AddFileComment,
         (KeyCode::Char('i'), KeyModifiers::NONE) => Action::EditComment,
+        (KeyCode::Char('e'), KeyModifiers::NONE) => Action::OpenInEditor,
         (KeyCode::Char('d'), KeyModifiers::NONE) => Action::PendingDCommand,
         (KeyCode::Char('v') | KeyCode::Char('V'), _) => Action::EnterVisualMode,
         (KeyCode::Char('y'), KeyModifiers::NONE) => Action::ExportToClipboard,
@@ -467,9 +471,9 @@ mod tests {
     }
 
     #[test]
-    fn should_leave_lowercase_e_unbound_in_normal_mode() {
+    fn should_map_lowercase_e_to_open_in_editor_in_normal_mode() {
         let action = map_normal_mode(key(KeyCode::Char('e')), DEFAULT_LEADER_KEY);
-        assert_eq!(action, Action::None);
+        assert_eq!(action, Action::OpenInEditor);
     }
 
     #[test]

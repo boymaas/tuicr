@@ -888,6 +888,10 @@ pub enum PrThreadsEvent {
 pub enum DiffViewMode {
     Unified,
     SideBySide,
+    /// gitsigns-style "final document" view: renders the whole new-side file
+    /// as one continuous buffer with a sign gutter (add/change/delete).
+    /// Deletions are hidden behind a marker until their hunk is revealed.
+    Document,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1138,6 +1142,10 @@ pub struct App {
     pub expanded_top: HashMap<GapId, Vec<DiffLine>>,
     /// Stores lines expanded upward from the lower boundary of each gap (in ascending line order)
     pub expanded_bottom: HashMap<GapId, Vec<DiffLine>>,
+    /// Hunks whose deletion lines are revealed inline in Document view, keyed
+    /// by `(file_idx, hunk_idx)`. Empty = every hunk shows the clean
+    /// final-document form with deletions collapsed to a gutter marker.
+    pub revealed_hunks: HashSet<(usize, usize)>,
     /// Cached file line counts (keyed by file_idx) to avoid repeated disk reads
     pub file_line_count_cache: HashMap<usize, u32>,
     /// Cached annotations describing what each rendered line represents
@@ -1820,7 +1828,8 @@ impl App {
             pending_editor_target: None,
             input_mode,
             focused_panel: FocusedPanel::Diff,
-            diff_view_mode: DiffViewMode::Unified,
+            diff_view_mode: DiffViewMode::Document,
+            revealed_hunks: HashSet::new(),
             file_list_state: FileListState::default(),
             comment_navigator_state: CommentNavigatorState::default(),
             diff_state: DiffState::default(),
@@ -5562,7 +5571,9 @@ impl App {
     pub fn pane_geometry(&self, inner: ratatui::layout::Rect, side: LineSide) -> PaneGeom {
         let w = self.lineno_width();
         match self.diff_view_mode {
-            DiffViewMode::Unified => {
+            // Document is a single-column new-side view; its content geometry
+            // matches unified (line-number gutter + sign column).
+            DiffViewMode::Unified | DiffViewMode::Document => {
                 let gutter = unified_gutter(w);
                 let content_width = (inner.width as usize).saturating_sub(gutter as usize);
                 PaneGeom {
@@ -5602,7 +5613,7 @@ impl App {
     ) -> LineSide {
         let w = self.lineno_width();
         match self.diff_view_mode {
-            DiffViewMode::Unified => ann_default,
+            DiffViewMode::Unified | DiffViewMode::Document => ann_default,
             DiffViewMode::SideBySide => {
                 let half_w = inner.width.saturating_sub(sbs_overhead(w)) / 2;
                 let divider = inner.x + sbs_left_gutter(w) + half_w;
@@ -5674,6 +5685,9 @@ impl App {
             self.down_released_since_arm = false;
             self.up_released_since_arm = false;
             self.diff_state.current_file_idx = idx;
+            // Document view shows the whole file; expand the newly-focused file
+            // before computing scroll offsets so heights reflect full content.
+            self.ensure_document_full_file();
             self.diff_state.cursor_line = self.calculate_file_scroll_offset(idx);
             self.diff_state.cursor_line = skip_decoration_forward(
                 &self.line_annotations,
@@ -5998,8 +6012,15 @@ impl App {
 
                 // Count diff lines based on view mode
                 match self.diff_view_mode {
-                    DiffViewMode::Unified => {
+                    DiffViewMode::Unified | DiffViewMode::Document => {
+                        // Mirror the annotation builder: Document collapses a
+                        // hunk's deletions to a gutter marker until revealed.
+                        let skip_deletions = self.diff_view_mode == DiffViewMode::Document
+                            && !self.revealed_hunks.contains(&(file_idx, hunk_idx));
                         for diff_line in &hunk.lines {
+                            if skip_deletions && diff_line.new_lineno.is_none() {
+                                continue;
+                            }
                             content_lines += 1;
 
                             if let Some(line_comments) = line_comments {
@@ -8202,14 +8223,42 @@ impl App {
             return;
         }
         self.diff_view_mode = match self.diff_view_mode {
+            DiffViewMode::Document => DiffViewMode::Unified,
             DiffViewMode::Unified => DiffViewMode::SideBySide,
-            DiffViewMode::SideBySide => DiffViewMode::Unified,
+            DiffViewMode::SideBySide => DiffViewMode::Document,
         };
         let mode_name = match self.diff_view_mode {
+            DiffViewMode::Document => "document",
             DiffViewMode::Unified => "unified",
             DiffViewMode::SideBySide => "side-by-side",
         };
+        // Document view is a single-file "buffer"; entering it pins single-file
+        // view and expands the current file to its full content.
+        if self.diff_view_mode == DiffViewMode::Document {
+            self.is_single_file_view = true;
+            self.ensure_document_full_file();
+        }
         self.set_message(format!("Diff view mode: {mode_name}"));
+        self.rebuild_annotations();
+    }
+
+    /// Document view: reveal or hide the deletion lines of the hunk under the
+    /// cursor. No-op outside Document view or when the cursor is not on a hunk.
+    pub fn toggle_hunk_diff_reveal_at_cursor(&mut self) {
+        if self.diff_view_mode != DiffViewMode::Document {
+            return;
+        }
+        let Some((file_idx, hunk_idx)) = self.hunk_at_cursor() else {
+            self.set_message("Move cursor to a hunk to show its diff");
+            return;
+        };
+        let key = (file_idx, hunk_idx);
+        if self.revealed_hunks.remove(&key) {
+            self.set_message("Hunk diff hidden");
+        } else {
+            self.revealed_hunks.insert(key);
+            self.set_message("Hunk diff shown");
+        }
         self.rebuild_annotations();
     }
 
@@ -9154,6 +9203,39 @@ impl App {
         }
     }
 
+    /// Document view shows the whole new-side file, so ensure every gap of the
+    /// current file is fully expanded. One-way (never collapses) and idempotent:
+    /// gaps already expanded are skipped, so repeated calls during navigation do
+    /// no extra fetching. No-op outside Document view.
+    pub fn ensure_document_full_file(&mut self) {
+        if self.diff_view_mode != DiffViewMode::Document {
+            return;
+        }
+        let file_idx = self.diff_state.current_file_idx;
+        let Some(file) = self.diff_files.get(file_idx) else {
+            return;
+        };
+        let hunk_count = file.hunks.len();
+        if hunk_count == 0 {
+            return;
+        }
+        let last_gap = if self.eof_gap_enabled() {
+            hunk_count
+        } else {
+            hunk_count.saturating_sub(1)
+        };
+        for hunk_idx in 0..=last_gap {
+            let gap = GapId { file_idx, hunk_idx };
+            if self.expanded_top.contains_key(&gap) || self.expanded_bottom.contains_key(&gap) {
+                continue;
+            }
+            if let Err(e) = self.expand_gap(gap, ExpandDirection::Both, None) {
+                self.set_error(format!("Full file expand failed: {e}"));
+                return;
+            }
+        }
+    }
+
     fn eof_gap_enabled(&self) -> bool {
         matches!(
             self.diff_source,
@@ -9396,7 +9478,11 @@ impl App {
 
                     // Diff lines - handle differently based on view mode
                     match self.diff_view_mode {
-                        DiffViewMode::Unified => {
+                        DiffViewMode::Unified | DiffViewMode::Document => {
+                            // Document collapses each hunk's deletions to a
+                            // gutter marker until the hunk is revealed.
+                            let skip_deletions = self.diff_view_mode == DiffViewMode::Document
+                                && !self.revealed_hunks.contains(&(file_idx, hunk_idx));
                             Self::build_unified_diff_annotations(
                                 &mut self.line_annotations,
                                 file_idx,
@@ -9407,6 +9493,7 @@ impl App {
                                 &self.forge_review_threads,
                                 &remote_index,
                                 self.diff_state.viewport_width,
+                                skip_deletions,
                             );
                         }
                         DiffViewMode::SideBySide => {
@@ -9578,7 +9665,12 @@ impl App {
         }
     }
 
-    /// Build annotations for unified diff mode (one annotation per diff line)
+    /// Build annotations for unified diff mode (one annotation per diff line).
+    ///
+    /// Document view reuses this builder; when `skip_deletions` is set (a hunk
+    /// whose diff is collapsed in the final-document form) lines that exist only
+    /// on the old side are omitted so the annotation stream mirrors the
+    /// new-side-only render.
     #[allow(clippy::too_many_arguments)]
     fn build_unified_diff_annotations(
         annotations: &mut Vec<AnnotatedLine>,
@@ -9590,8 +9682,12 @@ impl App {
         remote_threads: &[crate::forge::remote_comments::RemoteReviewThread],
         remote_index: &RemoteThreadIndex,
         viewport_width: usize,
+        skip_deletions: bool,
     ) {
         for (line_idx, diff_line) in lines.iter().enumerate() {
+            if skip_deletions && diff_line.new_lineno.is_none() {
+                continue;
+            }
             annotations.push(AnnotatedLine::DiffLine {
                 file_idx,
                 hunk_idx,

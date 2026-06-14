@@ -5773,45 +5773,69 @@ impl App {
     /// single-file view (only the current file's hunks) and the
     /// reviewed-collapse behavior in multi-file view (skipped entirely)
     /// versus single-file view (body rendered under a banner).
-    fn hunk_positions(&self) -> Vec<usize> {
-        let single = self.is_single_file_view;
-        let current_idx = self.diff_state.current_file_idx;
-        let mut positions = Vec::new();
-        let mut cumulative = self.review_comments_render_height();
-        for (file_idx, file) in self.diff_files.iter().enumerate() {
-            if single && file_idx != current_idx {
+    /// Annotation indices to land `]`/`[` on, one per hunk, top-to-bottom.
+    ///
+    /// Derived from `line_annotations` (the authoritative rendered layout) so it
+    /// is correct in every view — unified, side-by-side, full-file/Document —
+    /// without re-deriving offsets that would drift from the renderer. The
+    /// target within a hunk is the first *changed* line; fallbacks keep every
+    /// hunk reachable:
+    ///   1. first changed line — exactly one of old/new lineno set (add or del)
+    ///   2. first delete-marker line — a `line_idx` jump means Document hid the
+    ///      deletions above this row, so it carries the "deleted here" marker
+    ///   3. first line of the hunk, else the hunk header
+    fn hunk_target_lines(&self) -> Vec<usize> {
+        let anns = &self.line_annotations;
+        let mut targets = Vec::new();
+        let mut i = 0;
+        while i < anns.len() {
+            let AnnotatedLine::HunkHeader { file_idx, hunk_idx } = anns[i] else {
+                i += 1;
                 continue;
-            }
-            let path = file.display_path();
-            let is_reviewed = self.session.is_file_reviewed(path);
-
-            if !single {
-                cumulative += 1; // File header
-            }
-            if !single && is_reviewed {
-                // multi-file collapsed: no body, no trailing spacing
-                continue;
-            }
-            if single && is_reviewed {
-                cumulative += 1; // banner
-            }
-            if let Some(review) = self.session.files.get(path) {
-                cumulative += review.file_comments.len();
-            }
-            if file.is_binary || file.hunks.is_empty() {
-                cumulative += 1;
-            } else {
-                for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-                    positions.push(cumulative);
-                    cumulative += 1;
-                    if !self.is_hunk_reviewed(file_idx, hunk_idx) {
-                        cumulative += hunk.lines.len();
+            };
+            let header_idx = i;
+            let mut j = i + 1;
+            let mut first_line = None;
+            let mut first_change = None;
+            let mut first_marker = None;
+            let mut prev_line_idx: Option<usize> = None;
+            loop {
+                match anns.get(j) {
+                    Some(AnnotatedLine::DiffLine {
+                        file_idx: f,
+                        hunk_idx: h,
+                        line_idx,
+                        old_lineno,
+                        new_lineno,
+                    }) if *f == file_idx && *h == hunk_idx => {
+                        if first_line.is_none() {
+                            first_line = Some(j);
+                        }
+                        // A jump in `line_idx` means deletions were skipped just
+                        // above (Document collapsed view), so this row carries
+                        // the delete marker — the closest visible point to the
+                        // removal for a deletion-only hunk.
+                        let skipped = prev_line_idx.map_or(*line_idx > 0, |p| *line_idx > p + 1);
+                        if skipped && first_marker.is_none() {
+                            first_marker = Some(j);
+                        }
+                        if old_lineno.is_some() ^ new_lineno.is_some() {
+                            first_change = Some(j);
+                            break;
+                        }
+                        prev_line_idx = Some(*line_idx);
+                        j += 1;
                     }
+                    // Comments / threads anchor inside the hunk; step over them.
+                    Some(AnnotatedLine::LineComment { .. })
+                    | Some(AnnotatedLine::RemoteThreadLine { .. }) => j += 1,
+                    _ => break,
                 }
             }
-            cumulative += 1; // trailing spacing or "next file" hint
+            targets.push(first_change.or(first_marker).or(first_line).unwrap_or(header_idx));
+            i = j.max(header_idx + 1);
         }
-        positions
+        targets
     }
 
     pub fn next_hunk(&mut self) {
@@ -5821,7 +5845,7 @@ impl App {
         self.primed_walk_prev = false;
         self.down_released_since_arm = false;
         self.up_released_since_arm = false;
-        for pos in self.hunk_positions() {
+        for pos in self.hunk_target_lines() {
             if pos > self.diff_state.cursor_line {
                 self.diff_state.cursor_line = pos;
                 self.ensure_cursor_visible();
@@ -5836,7 +5860,7 @@ impl App {
             let next_idx = self.diff_state.current_file_idx + 1;
             if next_idx < self.diff_files.len() {
                 self.jump_to_file(next_idx);
-                if let Some(&first) = self.hunk_positions().first() {
+                if let Some(&first) = self.hunk_target_lines().first() {
                     self.diff_state.cursor_line = first;
                     self.ensure_cursor_visible();
                     self.update_current_file_from_cursor();
@@ -5850,7 +5874,7 @@ impl App {
         self.primed_walk_prev = false;
         self.down_released_since_arm = false;
         self.up_released_since_arm = false;
-        let positions = self.hunk_positions();
+        let positions = self.hunk_target_lines();
         for &pos in positions.iter().rev() {
             if pos < self.diff_state.cursor_line {
                 self.diff_state.cursor_line = pos;
@@ -5865,7 +5889,7 @@ impl App {
         if self.is_single_file_view && self.diff_state.current_file_idx > 0 {
             let prev_idx = self.diff_state.current_file_idx - 1;
             self.jump_to_file(prev_idx);
-            if let Some(&last) = self.hunk_positions().last() {
+            if let Some(&last) = self.hunk_target_lines().last() {
                 self.diff_state.cursor_line = last;
                 self.ensure_cursor_visible();
                 self.update_current_file_from_cursor();
@@ -15509,14 +15533,14 @@ mod single_file_view_tests {
         app.is_single_file_view = true;
         app.diff_state.current_file_idx = 0;
         app.rebuild_annotations();
-        let positions = app.hunk_positions();
+        let positions = app.hunk_target_lines();
         let last_hunk = *positions.last().expect("a.rs has two hunks");
         app.diff_state.cursor_line = last_hunk;
 
         // From a.rs's last hunk, `]` should land on b.rs's first hunk.
         app.next_hunk();
         assert_eq!(app.diff_state.current_file_idx, 1);
-        let new_first = *app.hunk_positions().first().expect("b.rs has hunks");
+        let new_first = *app.hunk_target_lines().first().expect("b.rs has hunks");
         assert_eq!(app.diff_state.cursor_line, new_first);
     }
 
@@ -15530,14 +15554,119 @@ mod single_file_view_tests {
         app.is_single_file_view = true;
         app.diff_state.current_file_idx = 1;
         app.rebuild_annotations();
-        let first_hunk = *app.hunk_positions().first().expect("b.rs has hunks");
+        let first_hunk = *app.hunk_target_lines().first().expect("b.rs has hunks");
         app.diff_state.cursor_line = first_hunk;
 
         // From b.rs's first hunk, `[` should land on a.rs's last hunk.
         app.prev_hunk();
         assert_eq!(app.diff_state.current_file_idx, 0);
-        let new_last = *app.hunk_positions().last().expect("a.rs has hunks");
+        let new_last = *app.hunk_target_lines().last().expect("a.rs has hunks");
         assert_eq!(app.diff_state.cursor_line, new_last);
+    }
+
+    fn dline(origin: LineOrigin, old: Option<u32>, new: Option<u32>) -> DiffLine {
+        DiffLine {
+            origin,
+            content: "x".to_string(),
+            old_lineno: old,
+            new_lineno: new,
+            highlighted_spans: None,
+        }
+    }
+
+    fn hunk_with(lines: Vec<DiffLine>) -> DiffHunk {
+        DiffHunk {
+            header: "@@ -1,9 +1,9 @@".to_string(),
+            lines,
+            old_start: 1,
+            old_count: 9,
+            new_start: 1,
+            new_count: 9,
+        }
+    }
+
+    /// `]` lands on the first changed line, skipping the @@ header and any
+    /// leading context inside the hunk.
+    #[test]
+    fn next_hunk_lands_on_first_changed_line() {
+        let lines = vec![
+            dline(LineOrigin::Context, Some(1), Some(1)),
+            dline(LineOrigin::Context, Some(2), Some(2)),
+            dline(LineOrigin::Addition, None, Some(3)),
+        ];
+        let mut app = app_with(vec![file("a.rs", vec![hunk_with(lines)])]);
+        app.rebuild_annotations();
+        app.diff_state.cursor_line = 0;
+        app.next_hunk();
+        let ann = &app.line_annotations[app.diff_state.cursor_line];
+        assert!(
+            matches!(
+                ann,
+                AnnotatedLine::DiffLine {
+                    old_lineno: None,
+                    new_lineno: Some(3),
+                    ..
+                }
+            ),
+            "expected to land on the addition, got {ann:?}"
+        );
+    }
+
+    /// Document view hides deletions: a change hunk lands on the added line.
+    #[test]
+    fn next_hunk_in_document_lands_on_added_line() {
+        let lines = vec![
+            dline(LineOrigin::Context, Some(1), Some(1)),
+            dline(LineOrigin::Deletion, Some(2), None),
+            dline(LineOrigin::Addition, None, Some(2)),
+        ];
+        let mut app = app_with(vec![file("a.rs", vec![hunk_with(lines)])]);
+        app.diff_view_mode = DiffViewMode::Document;
+        app.rebuild_annotations();
+        app.diff_state.cursor_line = 0;
+        app.next_hunk();
+        let ann = &app.line_annotations[app.diff_state.cursor_line];
+        assert!(
+            matches!(
+                ann,
+                AnnotatedLine::DiffLine {
+                    old_lineno: None,
+                    new_lineno: Some(2),
+                    ..
+                }
+            ),
+            "expected the added line, got {ann:?}"
+        );
+    }
+
+    /// Document deletion-only hunk has no visible change line, so `]` lands on
+    /// the delete-marker row (the line after the hidden deletion).
+    #[test]
+    fn next_hunk_in_document_lands_on_delete_marker_for_deletion_only_hunk() {
+        let lines = vec![
+            dline(LineOrigin::Context, Some(1), Some(1)),
+            dline(LineOrigin::Deletion, Some(2), None),
+            dline(LineOrigin::Context, Some(3), Some(2)),
+        ];
+        let mut app = app_with(vec![file("a.rs", vec![hunk_with(lines)])]);
+        app.diff_view_mode = DiffViewMode::Document;
+        app.rebuild_annotations();
+        app.diff_state.cursor_line = 0;
+        app.next_hunk();
+        let ann = &app.line_annotations[app.diff_state.cursor_line];
+        // The deletion (line_idx 1) is hidden; the marker rides the context row
+        // that follows it (line_idx 2, new_lineno 2).
+        assert!(
+            matches!(
+                ann,
+                AnnotatedLine::DiffLine {
+                    line_idx: 2,
+                    new_lineno: Some(2),
+                    ..
+                }
+            ),
+            "expected the delete-marker row, got {ann:?}"
+        );
     }
 
     #[test]
